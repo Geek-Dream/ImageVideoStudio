@@ -65,35 +65,67 @@ CFG = load_config()
 IMG_PORT, VID_PORT, SELF_PORT = CFG["img_port"], CFG["vid_port"], CFG["port"]
 
 # ---------------- 模型扫描 ----------------
-def known_models():
-    """读 models.json(随项目发布) + models.local.json(本机私有,不上传),按文件名给出友好名称/参数。"""
-    merged = {}
-    for fp in (MODELS_JSON, os.path.join(BASE, "models.local.json")):
+DIFF_DIR = os.path.join(MODELS_IMG, "diffusion")   # GGUF 主模型(unet)放这里
+ENC_DIR  = os.path.join(MODELS_IMG, "encoder")     # GGUF 文本编码器放这里
+VAE_DIR  = os.path.join(MODELS_IMG, "vae")         # GGUF 的 VAE 放这里
+LOCAL_JSON = os.path.join(BASE, "models.local.json")
+
+SAMPLER_DEFAULT = {"steps": 25, "cfg": 6.0, "sampler_name": "euler_ancestral", "scheduler": "normal"}
+
+def registry():
+    """合并 models.json(随项目发布) + models.local.json(本机私有,不上传)。
+    返回 (friendly文件名→显示信息, gguf模型定义列表)。"""
+    friendly, ggufs = {}, []
+    for fp in (MODELS_JSON, LOCAL_JSON):
         if os.path.exists(fp):
             try:
-                merged.update(json.load(open(fp)).get("models", {}))
+                d = json.load(open(fp))
+                friendly.update(d.get("models", {}))
+                ggufs.extend(d.get("gguf_models", []))
             except Exception:
                 pass
-    return merged
+    return friendly, ggufs
+
+def gguf_ok(e):
+    """GGUF 模型三件套(unet/编码器/vae)都在才算可用。"""
+    try:
+        return (os.path.exists(os.path.join(DIFF_DIR, e["unet"])) and
+                os.path.exists(os.path.join(ENC_DIR, e["clip"])) and
+                os.path.exists(os.path.join(VAE_DIR, e["vae"])))
+    except Exception:
+        return False
 
 def list_models():
-    """扫描 models/image 里的单文件模型,每个就是一个可选模型。"""
-    known = known_models()
+    """可选模型 = models/image 里的单文件 checkpoint + 三件套齐全的 GGUF 模型。"""
+    friendly, ggufs = registry()
     out = []
-    if not os.path.isdir(MODELS_IMG):
-        return out
-    for fn in sorted(os.listdir(MODELS_IMG)):
-        fp = os.path.join(MODELS_IMG, fn)
-        if not os.path.isfile(fp) or not fn.lower().endswith(IMG_EXTS):
-            continue
-        meta = known.get(fn, {})
-        out.append({
-            "id": fn,
-            "name": meta.get("name", fn),
-            "sec": int(meta.get("sec", 60)),
-            "desc": meta.get("desc", "单文件模型(checkpoint)"),
-        })
+    if os.path.isdir(MODELS_IMG):
+        for fn in sorted(os.listdir(MODELS_IMG)):
+            fp = os.path.join(MODELS_IMG, fn)
+            if os.path.isfile(fp) and fn.lower().endswith(IMG_EXTS):
+                meta = friendly.get(fn, {})
+                out.append({"id": fn, "kind": "checkpoint",
+                            "name": meta.get("name", fn),
+                            "sec": int(meta.get("sec", 60)),
+                            "desc": meta.get("desc", "单文件模型(checkpoint)")})
+    for e in ggufs:
+        if gguf_ok(e):
+            out.append({"id": e["id"], "kind": "gguf",
+                        "name": e.get("name", e["id"]),
+                        "sec": int(e.get("sec", 120)),
+                        "desc": e.get("desc", "GGUF 模型")})
     return out
+
+def find_entry(model_id):
+    """按 id 找到完整模型定义(生成时用)。"""
+    fp = os.path.join(MODELS_IMG, model_id)
+    if os.path.isfile(fp) and model_id.lower().endswith(IMG_EXTS):
+        return {"id": model_id, "kind": "checkpoint", "sampler": SAMPLER_DEFAULT}
+    _, ggufs = registry()
+    for e in ggufs:
+        if e.get("id") == model_id and gguf_ok(e):
+            return {**e, "kind": "gguf"}
+    return None
 
 def has_controlnet():
     if not os.path.isdir(MODELS_CN):
@@ -106,40 +138,53 @@ def first_controlnet():
             return f
     return ""
 
-# ---------------- ComfyUI 工作流(通用 checkpoint) ----------------
-def sampler_cfg():
-    return {"steps": 25, "cfg": 6.0, "sampler_name": "euler_ancestral", "scheduler": "normal"}
+# ---------------- ComfyUI 工作流(checkpoint / GGUF 双架构) ----------------
+def _enc_nodes(e):
+    """按模型架构返回 (加载器节点dict, clip接线, vae接线, model接线)。"""
+    if e["kind"] == "gguf":
+        # 用大编号 100/101/102,避免与 build_wf 里 5~11 的功能节点撞号
+        return ({"100": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": e["unet"]}},
+                 "101": {"class_type": e.get("clip_loader", "CLIPLoaderGGUF"),
+                         "inputs": {"clip_name": e["clip"], "type": e["clip_type"]}},
+                 "102": {"class_type": "VAELoader", "inputs": {"vae_name": e["vae"]}}},
+                ["101", 0], ["102", 0], ["100", 0])
+    return ({"1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": e["id"]}}},
+            ["1", 1], ["1", 2], ["1", 0])
 
-def build_wf(model, pos, neg, w, h, seed, mode="t2i", ref=None, mask=None,
+def build_wf(e, pos, neg, w, h, seed, mode="t2i", ref=None, mask=None,
              strength=0.6, scale=2.0, ctype="openpose"):
-    """model 即 checkpoint 文件名。loader 固定 CheckpointLoaderSimple(适合 SDXL/SD1.5 等单文件模型)。"""
-    ckpt = {"1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": model}}}
-    clip, vae, mdl = ["1", 1], ["1", 2], ["1", 0]
-    cfg = sampler_cfg()
-    wf = dict(ckpt)
-    wf["3"] = {"class_type": "CLIPTextEncode", "inputs": {"text": pos, "clip": clip}}
-    wf["4"] = {"class_type": "CLIPTextEncode", "inputs": {"text": neg, "clip": clip}}
+    """e 是 find_entry() 返回的模型定义。五种玩法: t2i/i2i/inpaint/upscale/pose。"""
+    loaders, clip_src, vae_src, model_src = _enc_nodes(e)
+    cfg = e.get("sampler", SAMPLER_DEFAULT)
+    wf = dict(loaders)
+    wf["3"] = {"class_type": "CLIPTextEncode", "inputs": {"text": pos, "clip": clip_src}}
+    wf["4"] = {"class_type": "CLIPTextEncode", "inputs": {"text": neg, "clip": clip_src}}
     pos_out = ["3", 0]
+    if e.get("flux_guidance"):  # flux 系正向要过 FluxGuidance
+        wf["3g"] = {"class_type": "FluxGuidance", "inputs": {"guidance": 3.5, "conditioning": ["3", 0]}}
+        pos_out = ["3g", 0]
 
-    if mode == "inpaint":
+    if mode == "inpaint":  # 局部重绘: 只重画涂抹区域
         wf["6"] = {"class_type": "LoadImage", "inputs": {"image": ref}}
         wf["7"] = {"class_type": "LoadImageMask", "inputs": {"image": mask, "channel": "red"}}
-        wf["8"] = {"class_type": "VAEEncodeForInpaint", "inputs": {"pixels": ["6", 0], "vae": vae, "mask": ["7", 0], "grow_mask_by": 6}}
-        wf["9"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": 1.0, "model": mdl, "positive": pos_out, "negative": ["4", 0], "latent_image": ["8", 0]}}
-        wf["10"] = {"class_type": "VAEDecode", "inputs": {"samples": ["9", 0], "vae": vae}}
+        wf["8"] = {"class_type": "VAEEncodeForInpaint", "inputs": {"pixels": ["6", 0], "vae": vae_src, "mask": ["7", 0], "grow_mask_by": 6}}
+        wf["9"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": 1.0, "model": model_src, "positive": pos_out, "negative": ["4", 0], "latent_image": ["8", 0]}}
+        wf["10"] = {"class_type": "VAEDecode", "inputs": {"samples": ["9", 0], "vae": vae_src}}
         wf["11"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": "ivs", "images": ["10", 0]}}
         return wf
 
-    if mode == "upscale":
+    if mode == "upscale":  # 放大: 先拉伸再低幅度重绘补细节
         wf["6"] = {"class_type": "LoadImage", "inputs": {"image": ref}}
         wf["7"] = {"class_type": "ImageScaleBy", "inputs": {"upscale_method": "lanczos", "scale_by": scale, "image": ["6", 0]}}
-        wf["8"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["7", 0], "vae": vae}}
-        wf["9"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": strength, "model": mdl, "positive": pos_out, "negative": ["4", 0], "latent_image": ["8", 0]}}
-        wf["10"] = {"class_type": "VAEDecode", "inputs": {"samples": ["9", 0], "vae": vae}}
+        wf["8"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["7", 0], "vae": vae_src}}
+        wf["9"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": strength, "model": model_src, "positive": pos_out, "negative": ["4", 0], "latent_image": ["8", 0]}}
+        wf["10"] = {"class_type": "VAEDecode", "inputs": {"samples": ["9", 0], "vae": vae_src}}
         wf["11"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": "ivs", "images": ["10", 0]}}
         return wf
 
-    if mode == "pose":
+    if mode == "pose":  # 姿势控制: 仅单文件 checkpoint(SDXL 系配 union controlnet)
+        if e["kind"] != "checkpoint":
+            raise ValueError("姿势控制只支持单文件模型(如 wai / SDXL 系)")
         cn = first_controlnet()
         if not cn:
             raise ValueError("未找到 ControlNet 辅助模型,请先放入 models/image/controlnet/")
@@ -148,23 +193,23 @@ def build_wf(model, pos, neg, w, h, seed, mode="t2i", ref=None, mask=None,
         wf["7"] = {"class_type": "ControlNetLoader", "inputs": {"control_net_name": cn}}
         wf["8"] = {"class_type": "SetUnionControlNetType", "inputs": {"control_net": ["7", 0], "type": ctype}}
         wf["9"] = {"class_type": "ControlNetApplyAdvanced", "inputs": {"positive": ["3", 0], "negative": ["4", 0], "control_net": ["8", 0], "image": ["6", 0], "strength": strength, "start_percent": 0.0, "end_percent": 1.0}}
-        wf["10"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": 1.0, "model": mdl, "positive": ["9", 0], "negative": ["9", 1], "latent_image": ["5", 0]}}
-        wf["11"] = {"class_type": "VAEDecode", "inputs": {"samples": ["10", 0], "vae": vae}}
+        wf["10"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": 1.0, "model": model_src, "positive": ["9", 0], "negative": ["9", 1], "latent_image": ["5", 0]}}
+        wf["11"] = {"class_type": "VAEDecode", "inputs": {"samples": ["10", 0], "vae": vae_src}}
         wf["12"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": "ivs", "images": ["11", 0]}}
         return wf
 
-    if mode == "i2i" and ref:
+    if mode == "i2i" and ref:  # 以图生图: 参考图编码进 latent,按 strength 重绘
         wf["5"] = {"class_type": "LoadImage", "inputs": {"image": ref}}
-        wf["6"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["5", 0], "vae": vae}}
-        wf["7"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": strength, "model": mdl, "positive": pos_out, "negative": ["4", 0], "latent_image": ["6", 0]}}
-        wf["8"] = {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": vae}}
+        wf["6"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["5", 0], "vae": vae_src}}
+        wf["7"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": strength, "model": model_src, "positive": pos_out, "negative": ["4", 0], "latent_image": ["6", 0]}}
+        wf["8"] = {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": vae_src}}
         wf["9"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": "ivs", "images": ["8", 0]}}
         return wf
 
     # t2i 普通文生图
-    wf["5"] = {"class_type": "EmptyLatentImage", "inputs": {"width": w, "height": h, "batch_size": 1}}
-    wf["6"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": 1.0, "model": mdl, "positive": pos_out, "negative": ["4", 0], "latent_image": ["5", 0]}}
-    wf["7"] = {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": vae}}
+    wf["5"] = {"class_type": e.get("latent", "EmptyLatentImage"), "inputs": {"width": w, "height": h, "batch_size": 1}}
+    wf["6"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": 1.0, "model": model_src, "positive": pos_out, "negative": ["4", 0], "latent_image": ["5", 0]}}
+    wf["7"] = {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": vae_src}}
     wf["8"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": "ivs", "images": ["7", 0]}}
     return wf
 
@@ -184,8 +229,11 @@ LOCK = threading.Lock()
 
 def submit(model, pos, neg, w, h, name, mode="t2i", ref=None, mask=None, strength=0.6, scale=2.0, ctype="openpose"):
     import random
+    e = find_entry(model)
+    if not e:
+        raise ValueError(f"模型不可用: {model}(文件缺失,检查 models/ 目录)")
     seed = random.randint(0, 2**31 - 1)
-    wf = build_wf(model, pos, neg, w, h, seed, mode, ref, mask, strength, scale, ctype)
+    wf = build_wf(e, pos, neg, w, h, seed, mode, ref, mask, strength, scale, ctype)
     req = urllib.request.Request(f"http://127.0.0.1:{IMG_PORT}/prompt",
                                  data=json.dumps({"prompt": wf}).encode(),
                                  headers={"Content-Type": "application/json"})
@@ -312,7 +360,7 @@ async function render(){
     const ms = await j('/api/models');
     ST.hasCN = (await j('/api/status')).has_cn;
     $('#app').innerHTML = `<h2>第二步:选生图模型</h2>` + ms.map(m=>`
-      <div class="card" onclick="pickModel('${m.id}','${m.name}',${m.sec})">
+      <div class="card" onclick="pickModel('${m.id}','${m.name}',${m.sec},'${m.kind}')">
         <b>${m.name}</b> <span class="small">约${m.sec}秒/张</span><div class="small">${m.desc}</div>
       </div>`).join('') + `<p><button class="back" onclick="home()">← 返回</button></p>`;
   }
@@ -348,7 +396,7 @@ async function render(){
     pollAll();
   }
 }
-function pickModel(id,name,sec){ ST.model=id; ST.mname=name; ST.msec=sec; ST.step=2; render(); }
+function pickModel(id,name,sec,kind){ ST.model=id; ST.mname=name; ST.msec=sec; ST.kind=kind; ST.step=2; render(); }
 function pickCount(){ ST.count=+$('#cnt').value; ST.items=[]; ST.step=3; render(); }
 function collect(i){
   const it=ST.items[i]; if(!it) return;
@@ -453,7 +501,7 @@ function cardHTML(i){
       <option value="i2i" ${it.mode==='i2i'?'selected':''}>以图生图(参考画风)</option>
       <option value="inpaint" ${it.mode==='inpaint'?'selected':''}>局部重绘(涂哪改哪)</option>
       <option value="upscale" ${it.mode==='upscale'?'selected':''}>放大变清晰</option>
-      ${ST.hasCN?`<option value="pose" ${it.mode==='pose'?'selected':''}>姿势控制(骨架/线稿)</option>`:''}
+      ${(ST.kind==='checkpoint'&&ST.hasCN)?`<option value="pose" ${it.mode==='pose'?'selected':''}>姿势控制(骨架/线稿)</option>`:''}
     </select>${mid}
     <label>${posLabel}</label><textarea id="pos${i}" placeholder="例: a cat, masterpiece, best quality">${it.pos}</textarea>
     <label>不想要什么(负向提示词)</label><textarea id="neg${i}">${it.neg}</textarea></div>`;

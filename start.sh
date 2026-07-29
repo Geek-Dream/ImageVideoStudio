@@ -70,7 +70,7 @@ if running || port_up; then
 else
     MEM_GB=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1024 / 1024 / 1024 ))
     [ "$MEM_GB" -lt 16 ] && echo "⚠ 本机内存 ${MEM_GB}GB 偏小,建议关闭其他大软件"
-    mkdir -p "$BASE/output/comfy" "$BASE/models/image/controlnet" "$BASE/models/video"
+    mkdir -p "$BASE/output/comfy" "$BASE/models/image/controlnet" "$BASE/models/image/diffusion" "$BASE/models/image/encoder" "$BASE/models/image/vae" "$BASE/models/video"
     YAML="$BASE/extra_model_paths.yaml"
     cat > "$YAML" <<EOF
 # 本文件由 start.sh 自动生成,把项目的 models/ 目录挂进 ComfyUI
@@ -78,10 +78,15 @@ ivs:
   base_path: $BASE/models
   checkpoints: image
   controlnet: image/controlnet
-  vae: image
-  clip: image
+  diffusion_models: image/diffusion
+  text_encoders: image/encoder
+  clip: image/encoder
+  vae: image/vae
+ivs_video:
+  base_path: $BASE/models
   diffusion_models: video
   text_encoders: video
+  vae: video
 EOF
     if [ -x "$COMFY_DIR/venv/bin/python" ]; then PY="$COMFY_DIR/venv/bin/python"; else PY="python3"; fi
     echo "正在启动生图服务(端口 $IMG_PORT,首次加载模型要 1~2 分钟)…"
