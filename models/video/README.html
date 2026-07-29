@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8"><title>视频模型放这里 · ImageVideoStudio</title>
+<style>
+body{font-family:-apple-system,'PingFang SC',sans-serif;max-width:760px;margin:24px auto;padding:0 16px;line-height:1.7;color:#222}
+h1{font-size:22px}h2{font-size:17px;margin-top:22px}
+code{background:#f0f0f3;border-radius:4px;padding:1px 6px}
+a{color:#4f7cff}
+.m{border:1px solid #e2e2e6;border-radius:10px;padding:12px 16px;margin:10px 0}
+.tip{background:#fff7e6;border:1px solid #ffd591;border-radius:10px;padding:10px 14px}
+small{color:#888}
+</style></head><body>
+<h1>🎬 这个文件夹放「视频模型」</h1>
+<p>视频生成比图片<b>更吃内存、参数更多</b>,所以网页里点「视频生成」会直接打开 ComfyUI 原始网页来操作(功能更全)。<br>
+<small>把视频模型文件放进本文件夹(<code>models/video/</code>),ComfyUI 就能认到。</small></p>
+
+<h2>推荐(相对省内存、上手快)</h2>
+<div class="m"><b>LTX-Video(推荐,轻量快速)</b><br>
+<small>Lightricks 开源,生成快、对内存友好,适合先体验视频生成。</small><br>
+页面: <a href="https://huggingface.co/Lightricks/LTX-Video">huggingface.co/Lightricks/LTX-Video</a><br>
+ComfyUI 官方打包(含工作流): <a href="https://huggingface.co/Comfy-Org/LTX-Video">huggingface.co/Comfy-Org/LTX-Video</a></div>
+
+<div class="m"><b>Wan2.1(效果更好,更吃配置)</b><br>
+<small>通义万相开源,画质更好但更大更慢,内存≥32GB 再考虑。</small><br>
+页面: <a href="https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B">huggingface.co/Wan-AI/Wan2.1-T2V-1.3B</a></div>
+
+<div class="tip"><b>💡 提示</b>:视频生成对新手偏复杂(要配文本编码器、选工作流)。建议先用「图片生成」跑通,再来折腾视频。视频模型通常还需要配套的文本编码器,一起放进本文件夹即可。</div>
+</body></html>

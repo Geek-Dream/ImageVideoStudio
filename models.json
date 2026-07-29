@@ -1,0 +1,7 @@
+{
+  "models": {
+    "sd_xl_base_1.0.safetensors": { "name": "SDXL Base 官方通用", "sec": 40, "desc": "Stability 官方底模,什么都能画,新手推荐" },
+    "RealVisXL_V4.0.safetensors": { "name": "RealVisXL 写实照片", "sec": 40, "desc": "真人写实照片风格" },
+    "animagine-xl-3.1.safetensors": { "name": "Animagine 动漫", "sec": 40, "desc": "二次元动漫风格" }
+  }
+}

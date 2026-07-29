@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8"><title>图片辅助模型(ControlNet)放这里 · ImageVideoStudio</title>
+<style>
+body{font-family:-apple-system,'PingFang SC',sans-serif;max-width:760px;margin:24px auto;padding:0 16px;line-height:1.7;color:#222}
+h1{font-size:22px}h2{font-size:17px;margin-top:22px}
+code{background:#f0f0f3;border-radius:4px;padding:1px 6px}
+a{color:#4f7cff}
+.m{border:1px solid #e2e2e6;border-radius:10px;padding:12px 16px;margin:10px 0}
+.tip{background:#fff7e6;border:1px solid #ffd591;border-radius:10px;padding:10px 14px}
+small{color:#888}
+</style></head><body>
+<h1>🦴 这个文件夹放「图片辅助模型(ControlNet)」</h1>
+<p>这是<b>可选</b>的。只有你想用「<b>姿势控制</b>」(给一张骨架图/线稿,让人物照着摆姿势)这个玩法时,才需要在这里放一个 ControlNet 模型。<br>
+<small>普通文生图、图生图、局部重绘、放大都<b>不需要</b>它。放好之后,网页的玩法下拉里才会出现「姿势控制」。</small></p>
+
+<h2>推荐(一个文件搞定所有控制类型)</h2>
+<div class="m"><b>controlnet-union-sdxl-1.0(推荐)</b><br>
+<small>一个文件同时支持 骨架openpose / 涂鸦scribble / 深度depth / 线稿canny,约 2.5GB,配 SDXL 图片模型用。</small><br>
+官方: <a href="https://huggingface.co/xinsir/controlnet-union-sdxl-1.0/resolve/main/diffusion_pytorch_model.safetensors">diffusion_pytorch_model.safetensors</a><br>
+国内镜像: <a href="https://hf-mirror.com/xinsir/controlnet-union-sdxl-1.0/resolve/main/diffusion_pytorch_model.safetensors">hf-mirror 同款</a><br>
+<small>下载后建议改名为 <code>controlnet-union-sdxl-1.0.safetensors</code> 再放进本文件夹。</small></div>
+
+<div class="tip"><b>⚠ 注意</b>:ControlNet 和图片模型「架构要配套」。上面这个是 <b>SDXL</b> 用的,请搭配 SDXL 系列的图片模型(如推荐的 SDXL Base / Animagine)。</div>
+</body></html>
