@@ -18,7 +18,7 @@ OUT_DIR    = os.path.join(BASE, "output", "images")        # 成品图(网页可
 COMFY_OUT  = os.path.join(BASE, "output", "comfy")         # ComfyUI 的临时输出(start.sh 指定)
 MODELS_JSON= os.path.join(BASE, "models.json")             # 已知模型的友好名称/参数(可选)
 
-IMG_EXTS = (".safetensors", ".ckpt", ".pt", ".pth", ".gguf")
+IMG_EXTS = (".safetensors", ".ckpt", ".pt", ".pth")  # 仅单文件 checkpoint;GGUF 需多文件配套,本工具不支持
 NEG_DEFAULT = "blurry, low quality, worst quality, watermark, text"
 
 # ---------------- 配置读写 ----------------
@@ -66,13 +66,15 @@ IMG_PORT, VID_PORT, SELF_PORT = CFG["img_port"], CFG["vid_port"], CFG["port"]
 
 # ---------------- 模型扫描 ----------------
 def known_models():
-    """读 models.json(可选),按文件名给出友好名称/参数。"""
-    if os.path.exists(MODELS_JSON):
-        try:
-            return json.load(open(MODELS_JSON)).get("models", {})
-        except Exception:
-            return {}
-    return {}
+    """读 models.json(随项目发布) + models.local.json(本机私有,不上传),按文件名给出友好名称/参数。"""
+    merged = {}
+    for fp in (MODELS_JSON, os.path.join(BASE, "models.local.json")):
+        if os.path.exists(fp):
+            try:
+                merged.update(json.load(open(fp)).get("models", {}))
+            except Exception:
+                pass
+    return merged
 
 def list_models():
     """扫描 models/image 里的单文件模型,每个就是一个可选模型。"""
