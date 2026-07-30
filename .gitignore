@@ -1,0 +1,35 @@
+# ---- 模型文件(太大,不上传;每个文件夹的 README.html 会保留) ----
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.gguf
+*.bin
+*.onnx
+# 模型目录(本体或符号链接都不上传)
+models/image/diffusion
+models/image/encoder
+models/image/vae
+
+# ---- 生成的图片/视频 ----
+output/*
+!output/.gitkeep
+
+# ---- ComfyUI 本体(install.sh 会下载,不上传) ----
+ComfyUI/
+venv/
+
+# ---- 本机配置与运行产物(因人而异,不上传) ----
+config.json
+models.local.json
+model_notes.json
+video_config.json
+video_paths.yaml
+extra_model_paths.yaml
+*.log
+*.pid
+
+# ---- 系统垃圾 ----
+.DS_Store
+__pycache__/
+*.pyc

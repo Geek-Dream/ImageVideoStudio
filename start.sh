@@ -24,14 +24,25 @@ IMG_PORT="$(read_cfg img_port)"; IMG_PORT="${IMG_PORT:-8849}"
 running() { [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; }
 port_up() { curl -s --max-time 2 -o /dev/null "http://127.0.0.1:$IMG_PORT" 2>/dev/null; }
 
-# ---------- 停止 ----------
-if [ "$1" = "stop" ]; then
+# ---------- 停止(函数,stop 命令和退出菜单共用) ----------
+stop_svc() {
     if running; then
         kill "$(cat "$PID_FILE")" 2>/dev/null
         for _ in 1 2 3 4 5 6 7 8; do running || break; sleep 1; done
         running && kill -9 "$(cat "$PID_FILE")" 2>/dev/null
-        rm -f "$PID_FILE"; echo "✔ 生图服务已停止"
-    else echo "○ 生图服务本来就没在跑"; fi
+        rm -f "$PID_FILE"
+    fi
+    # 兜底: 端口还占着(服务不是本次脚本起的)也一起停
+    PIDS=$(lsof -ti :"$IMG_PORT" 2>/dev/null)
+    if [ -n "$PIDS" ]; then
+        kill $PIDS 2>/dev/null
+        for _ in 1 2 3 4 5; do port_up || break; sleep 1; done
+    fi
+    if port_up; then echo "⚠ 端口 $IMG_PORT 还被占着,可能没停干净"; else echo "✔ 生图服务已彻底停止,内存已释放"; fi
+}
+
+if [ "$1" = "stop" ]; then
+    stop_svc
     exit 0
 fi
 
@@ -53,16 +64,24 @@ write_cfg comfy_dir "$COMFY_DIR"
 echo "✔ ComfyUI: $COMFY_DIR"
 
 # ---------- 第 2 步:检查模型(没有就不开网页) ----------
-shopt -s nullglob
-MODELS=( "$BASE"/models/image/*.safetensors "$BASE"/models/image/*.ckpt )
-if [ ${#MODELS[@]} -eq 0 ]; then
+# 用 gen.py 的 list_models() 数真实可用的模型(单文件 checkpoint + GGUF 三件套都算)
+MODEL_INFO="$(python3 -c "
+import sys; sys.path.insert(0,'$BASE')
+import gen
+ms = gen.list_models()
+print(len(ms))
+for m in ms: print(' - ' + m['name'])
+" 2>/dev/null)"
+MODEL_COUNT="$(echo "$MODEL_INFO" | head -1)"
+if [ -z "$MODEL_COUNT" ] || [ "$MODEL_COUNT" = "0" ]; then
     echo "------------------------------------------------"
-    echo "✘ models/image/ 里还没有图片模型,先不开网页。"
-    echo "  请打开 models/image/README.html,里面有推荐模型和下载链接,"
-    echo "  下载的 .safetensors 文件放进 models/image/ 后,再跑 ./start.sh"
+    echo "✘ 一个可用的图片模型都没有,先不开网页。"
+    echo "  至少得有一个模型才能生成。请打开 models/image/README.html,"
+    echo "  里面有推荐模型和下载链接;下载的模型文件放进 models/image/ 后,再跑 ./start.sh"
     exit 1
 fi
-echo "✔ 检测到 ${#MODELS[@]} 个图片模型"
+echo "✔ 检测到 $MODEL_COUNT 个可用模型:"
+echo "$MODEL_INFO" | tail -n +2
 
 # ---------- 第 3 步:启动生图服务(若没在跑) ----------
 if running || port_up; then
@@ -108,7 +127,26 @@ fi
 
 # ---------- 第 4 步:打开网页操作台 ----------
 echo "------------------------------------------------"
-echo "🎨 正在打开网页操作台(Ctrl+C 只关网页,服务继续跑;"
-echo "   想彻底停止服务: ./start.sh stop)"
+echo "🎨 正在打开网页操作台(在网页那里按 Ctrl+C 或关闭网页后,"
+echo "   回到这里会问你退出的方式)"
 echo "------------------------------------------------"
-exec python3 "$BASE/gen.py"
+trap '' INT   # 本脚本忽略 Ctrl+C,保证网页被杀后菜单能弹出来
+( trap - INT; exec python3 "$BASE/gen.py" )  # 子进程把 Ctrl+C 重置回默认,网页才能被 Ctrl+C 杀掉(否则继承"忽略"会按不动)
+trap - INT    # 恢复默认
+
+# 网页关闭后,问用户怎么退
+echo ""
+echo "================================================"
+echo "  网页已关闭。生图服务还在后台跑着(模型仍占内存)。"
+echo "================================================"
+echo "  1) 退出       —— 只退出本脚本,生图服务继续跑(下次 ./start.sh 直接用)"
+echo "  2) 彻底退出   —— 连生图服务(ComfyUI)一起关,释放内存"
+echo "------------------------------------------------"
+while true; do
+    read -r -p "选 1 或 2 后回车: " ans || { ans=1; echo; }  # 终端断开时按 1 处理
+    case "$ans" in
+        1) echo "✔ 已退出。生图服务仍在后台;想彻底关随时跑: ./start.sh stop"; break;;
+        2) stop_svc; break;;
+        *) echo "  请输入 1 或 2";;
+    esac
+done
