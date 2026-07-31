@@ -169,11 +169,18 @@ def _enc_nodes(e):
     """按模型架构返回 (加载器节点dict, clip接线, vae接线, model接线)。"""
     if e["kind"] == "gguf":
         # 用大编号 100/101/102,避免与 build_wf 里 5~11 的功能节点撞号
-        return ({"100": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": e["unet"]}},
+        nodes = {"100": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": e["unet"]}},
                  "101": {"class_type": e.get("clip_loader", "CLIPLoaderGGUF"),
                          "inputs": {"clip_name": e["clip"], "type": e["clip_type"]}},
-                 "102": {"class_type": "VAELoader", "inputs": {"vae_name": e["vae"]}}},
-                ["101", 0], ["102", 0], ["100", 0])
+                 "102": {"class_type": "VAELoader", "inputs": {"vae_name": e["vae"]}}}
+        model_src = ["100", 0]
+        if e.get("lora"):  # 模型挂了 LoRA 补丁(如 flux 的 NSFW 补丁),串在 unet 后面
+            nodes["103"] = {"class_type": "LoraLoaderModelOnly",
+                            "inputs": {"lora_name": e["lora"],
+                                       "strength_model": e.get("lora_strength", 1.0),
+                                       "model": ["100", 0]}}
+            model_src = ["103", 0]
+        return (nodes, ["101", 0], ["102", 0], model_src)
     return ({"1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": e["id"]}}},
             ["1", 1], ["1", 2], ["1", 0])
 

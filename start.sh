@@ -101,6 +101,7 @@ ivs:
   text_encoders: image/encoder
   clip: image/encoder
   vae: image/vae
+  loras: image/loras
 ivs_video:
   base_path: $BASE/models
   diffusion_models: video
