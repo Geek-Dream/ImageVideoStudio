@@ -1,0 +1,46 @@
+{
+  "models": [
+    {
+      "id": "huihui-mtp",
+      "key": "HUIHUI_MTP",
+      "name": "Huihui-MTP",
+      "tag": "聊天/写作/无审查主力",
+      "desc": "Qwen3.6-35B-A3B + Claude-4.7-Opus 消融无审查 MTP 版,带视觉。显存要求高,加载最慢。",
+      "gguf": "models/llm/huihui-mtp-Q4_K.gguf",
+      "mmproj": "models/llm/aux/mmproj-huihui-f16.gguf",
+      "chat_template": null,
+      "is_reasoning": true,
+      "has_mtp": true,
+      "gpu_mb": 25600,
+      "defaults": {"thinking": true, "temp": 0.7, "max_tokens": 16384}
+    },
+    {
+      "id": "qwen3-coder",
+      "key": "QWEN3_CODER",
+      "name": "Qwen3-Coder",
+      "tag": "写代码/工具调用担当",
+      "desc": "阿里编程专精 30B MoE,速度最快。非思考型、有审查、无视觉。",
+      "gguf": "models/llm/qwen3-coder-30B-Q4_K_M.gguf",
+      "mmproj": null,
+      "chat_template": null,
+      "is_reasoning": false,
+      "has_mtp": false,
+      "gpu_mb": 20480,
+      "defaults": {"thinking": false, "temp": 0.7, "max_tokens": 16384}
+    },
+    {
+      "id": "qwythos",
+      "key": "QWYTHOS",
+      "name": "Qwythos-9B",
+      "tag": "挂机/轻量担当",
+      "desc": "Claude-Mythos-5 蒸馏 6.2G 小钢炮,带视觉,显存要求最低、加载最快。",
+      "gguf": "models/llm/qwythos-9B-Q4_K.gguf",
+      "mmproj": "models/llm/aux/mmproj-qwythos-bf16.gguf",
+      "chat_template": "models/llm/aux/chat_template.lenient.jinja",
+      "is_reasoning": true,
+      "has_mtp": false,
+      "gpu_mb": 10240,
+      "defaults": {"thinking": true, "temp": 0.7, "max_tokens": 8192}
+    }
+  ]
+}

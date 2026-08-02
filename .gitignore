@@ -26,8 +26,21 @@ model_notes.json
 video_config.json
 video_paths.yaml
 extra_model_paths.yaml
+current_llm.json
+llm_prefs.json
 *.log
 *.pid
+
+# ---- 提示词与个人内容(用户私有,不上传) ----
+prompts/
+prompts_sfw/
+test_prompts/
+my_story/
+update_prompts.py
+*.bak
+
+# ---- 语言模型软链(指向本机其他目录,因人而异) ----
+models/llm/
 
 # ---- 系统垃圾 ----
 .DS_Store
