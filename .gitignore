@@ -20,6 +20,7 @@ ComfyUI/
 venv/
 
 # ---- 本机配置与运行产物(因人而异,不上传) ----
+PLAN.md
 config.json
 models.local.json
 model_notes.json
@@ -36,13 +37,29 @@ prompts/
 prompts_sfw/
 test_prompts/
 my_story/
+stories/
+refs/
+prompts.txt
+# 图片测试场任务队列+提示词+状态(用户私有)
+test_jobs/
+# 气泡编辑器字体库(版权字体,不上传)
+fonts/
+# OOTT 人设模板(用户私有)
+oott/
 update_prompts.py
+# 故事提示词/story.txt 产物(用户私有)
+scripts/output/
 *.bak
 
 # ---- 语言模型软链(指向本机其他目录,因人而异) ----
 models/llm/
 
+# ---- 语音模型与声音库(模型大文件+个人录音,不上传) ----
+models/tts/
+
 # ---- 系统垃圾 ----
 .DS_Store
 __pycache__/
 *.pyc
+# 本地下载模型的隐藏脚本(因人而异)
+.dl_*.sh

@@ -9,7 +9,7 @@
 #     (阻塞等 PID 消失 + 端口释放),否则 swap 双占拖死整机(教训见 PLAN.md)。
 # 依赖: 仅标准库。
 # ============================================================
-import json, os, signal, subprocess, time, urllib.request
+import json, os, signal, socket, subprocess, time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -52,10 +52,12 @@ def pid_alive(pid_file):
     except Exception:
         return False
 
-def port_up(port, timeout=2):
+def port_up(port, timeout=0.4):
+    """TCP 直连探测端口。用原始 socket 而非 urllib: urllib 会读 http_proxy 环境变量,
+    本机挂代理时探测 127.0.0.1 也被绕去走代理,每次白等满超时(start.sh 状态页卡顿的元凶)。"""
     try:
-        urllib.request.urlopen(f"http://127.0.0.1:{port}", timeout=timeout)
-        return True
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
     except Exception:
         return False
 
@@ -92,6 +94,8 @@ ivs:
   clip: image/encoder
   vae: image/vae
   loras: image/loras
+  ipadapter: image/ipadapter
+  clip_vision: image/clip_vision
 ivs_video:
   base_path: {base}/models
   diffusion_models: video

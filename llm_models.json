@@ -12,7 +12,11 @@
       "is_reasoning": true,
       "has_mtp": true,
       "gpu_mb": 25600,
-      "defaults": {"thinking": true, "temp": 0.7, "max_tokens": 16384}
+      "defaults": {
+        "thinking": true,
+        "temp": 0.7,
+        "max_tokens": 16384
+      }
     },
     {
       "id": "qwen3-coder",
@@ -26,7 +30,11 @@
       "is_reasoning": false,
       "has_mtp": false,
       "gpu_mb": 20480,
-      "defaults": {"thinking": false, "temp": 0.7, "max_tokens": 16384}
+      "defaults": {
+        "thinking": false,
+        "temp": 0.7,
+        "max_tokens": 16384
+      }
     },
     {
       "id": "qwythos",
@@ -40,7 +48,11 @@
       "is_reasoning": true,
       "has_mtp": false,
       "gpu_mb": 10240,
-      "defaults": {"thinking": true, "temp": 0.7, "max_tokens": 8192}
+      "defaults": {
+        "thinking": true,
+        "temp": 0.7,
+        "max_tokens": 8192
+      }
     }
   ]
 }

@@ -96,6 +96,7 @@ def build_args(m, thinking, temp, max_tokens):
             "-c", str(ctx),
             "-n", str(int(max_tokens)),
             "--temp", str(float(temp)),
+            "--repeat-penalty", "1.1",   # 防"一句话反复说"死循环(蒸馏小模型尤其需要,默认1.0=关)
             "--cache-type-k", "q8_0",
             "--cache-type-v", "q8_0",
             "--host", "127.0.0.1",
@@ -104,7 +105,8 @@ def build_args(m, thinking, temp, max_tokens):
             "--reasoning", reasoning]
     mm = m.get("mmproj")
     if mm and os.path.exists(os.path.join(BASE, mm)):   # 无视觉文件自动跳过
-        args += ["--mmproj", os.path.join(BASE, mm)]
+        args += ["--mmproj", os.path.join(BASE, mm),
+                 "--image-min-tokens", "1024"]   # Qwen-VL 系官方建议值,低了图片识别精度差(启动日志警告)
     ct = m.get("chat_template")
     if ct and os.path.exists(os.path.join(BASE, ct)):
         args += ["--chat-template-file", os.path.join(BASE, ct)]
@@ -213,13 +215,22 @@ def _activity():
     ge = None
     for m in re.finditer(r"(?<!prompt )eval time =\s*[\d.]+ ms /\s*(\d+) (?:tokens|runs)[^\n]*?([\d.]+) tokens per second", txt):
         ge = m
-    task_at = max(txt.rfind("processing task"), pp.start() if pp else -1, ge.start() if ge else -1)
-    last_tps = float(ge.group(2)) if ge else (float(pp.group(3)) if pp else None)
+    tg = None  # 新版 llama-server 生成中周期性打印: n_decoded = N, tg = X t/s
+    for m in re.finditer(r"n_decoded =\s*(\d+),\s*tg =\s*([\d.]+) t/s", txt):
+        tg = m
+    task_at = max(txt.rfind("processing task"), pp.start() if pp else -1,
+                  ge.start() if ge else -1, tg.start() if tg else -1)
+    last_tps = float(ge.group(2)) if ge else (float(tg.group(2)) if tg else (float(pp.group(3)) if pp else None))
     if idle_at >= task_at:
         return {"state": "idle", "tps": last_tps}
-    if pp and pp.start() > (ge.start() if ge else -1) and float(pp.group(2)) < 0.99:
+    if pp and pp.start() > (ge.start() if ge else -1) and pp.start() > (tg.start() if tg else -1) and float(pp.group(2)) < 0.99:
         return {"state": "prompt", "progress": float(pp.group(2)),
                 "n": int(pp.group(1)), "tps": float(pp.group(3))}
+    if tg and tg.start() > (ge.start() if ge else -1):  # 生成中: 用实时 tg 速度(而非 prefill 速度)
+        r = {"state": "gen", "tps": float(tg.group(2)), "n": int(tg.group(1))}
+        if pp:
+            r["read_tps"] = float(pp.group(3))  # 顺带带上本任务读输入的速度
+        return r
     return {"state": "gen", "tps": last_tps}
 
 def stats():
@@ -275,3 +286,14 @@ def resume_llm():
         return {"ok": False, "error": "没有可恢复的模型记录"}
     return start_llm(info["id"], bool(info.get("thinking", True)),
                      float(info.get("temp", 0.7)), int(info.get("max_tokens", 16384)))
+
+def close_llm():
+    """彻底关闭: 停进程 + 删掉状态记录(current_llm.json)。
+    与"暂停"不同——暂停要保留记录供"恢复"原样拉起;关闭则清除。
+    否则 stats() 会一直读到 paused=true,每次打开页面都被强制跳回"已暂停"页。"""
+    r = svc.stop_svc("llm")
+    try:
+        os.remove(CUR_FILE)
+    except OSError:
+        pass
+    return r
