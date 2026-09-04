@@ -63,3 +63,12 @@ __pycache__/
 *.pyc
 # 本地下载模型的隐藏脚本(因人而异)
 .dl_*.sh
+
+# ---- 官方 GPT-OSS Metal 独立环境/权重(本机安装,不上传) ----
+metal/.venv/
+metal/gpt-oss/
+metal/models/
+
+# Qwen3.8 FastMTP 专用 llama.cpp（本机补丁源码与 Apple Metal 构建产物）
+fastmtp-llama.cpp/
+fastmtp-src.tar.gz

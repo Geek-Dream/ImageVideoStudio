@@ -69,17 +69,26 @@ def gen_one(prompt, model_name=None, ref_name=None, style_prefix=None, ipa_name=
 
 # --------------- 2. 服务/参考图(批量级,一次性) ---------------
 
-def ensure_img_service():
-    """起生图服务(内存互斥: 会先停语言模型)。返回是否就绪。"""
+def ensure_img_service_ready():
+    """启动并等待 ComfyUI API 真正就绪，返回诊断结果。"""
     print("启动生图服务…")
-    svc.start_svc("img")
+    started = svc.start_svc("img")
+    if not started.get("ok"):
+        return {"ok": False, "error": started.get("error", "生图服务启动失败")}
+    last = {}
     for _ in range(60):
-        if svc.svc_status("img")["running"]:
+        last = svc.comfy_health("img")
+        if last.get("api_ok"):
             print("✔ 生图服务就绪")
-            return True
+            return {"ok": True, "detail": last}
         time.sleep(3)
-    print("⚠ 生图服务可能未就绪,请检查 comfy.log")
-    return False
+    print(f"⚠ 生图服务未就绪: {last.get('error', '未知错误')}; 请检查 comfy.log")
+    return {"ok": False, "error": last.get("error", "生图服务未就绪"), "detail": last}
+
+
+def ensure_img_service():
+    """兼容旧调用方，返回服务是否就绪。"""
+    return ensure_img_service_ready().get("ok", False)
 
 def upload_ref_once(ref_path=REF):
     """有本地参考图就上传一次,返回服务端文件名;没有/失败返回 None(纯文字)。"""

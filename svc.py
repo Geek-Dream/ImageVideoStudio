@@ -9,7 +9,7 @@
 #     (阻塞等 PID 消失 + 端口释放),否则 swap 双占拖死整机(教训见 PLAN.md)。
 # 依赖: 仅标准库。
 # ============================================================
-import json, os, signal, socket, subprocess, time
+import json, os, signal, socket, subprocess, time, urllib.request
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -61,13 +61,53 @@ def port_up(port, timeout=0.4):
     except Exception:
         return False
 
+def _comfy_child_alive(port):
+    """ComfyUI 会在部分 macOS/venv 启动方式下由父进程派生真正监听端口的子进程。
+    父 PID 退出但 ComfyUI 仍正常工作时,用端口上的命令行做一次窄匹配恢复状态。"""
+    try:
+        out = subprocess.check_output(["lsof", "-ti", f":{port}"], stderr=subprocess.DEVNULL).split()
+        for raw in out:
+            pid = int(raw)
+            cmd = subprocess.check_output(["ps", "-p", str(pid), "-o", "command="], stderr=subprocess.DEVNULL).decode(errors="ignore")
+            if "main.py" in cmd and f"--port {port}" in cmd and "extra-model-paths-config" in cmd:
+                return True
+    except Exception:
+        pass
+    return False
+
 def svc_status(stype):
-    """双保险状态: alive_pid=进程在, port_up=端口通, running=两者皆真。"""
+    """双保险状态: PID+端口;兼容 ComfyUI 派生子进程实际监听端口的情况。"""
     s = _services()[stype]
     ap = pid_alive(s["pid"])
     pu = port_up(s["port"])
+    if not ap and s["kind"] == "comfy" and pu:
+        ap = _comfy_child_alive(s["port"])
     return {"type": stype, "name": s["name"], "port": s["port"],
             "alive_pid": ap, "port_up": pu, "running": ap and pu}
+
+
+def comfy_health(stype="img", timeout=3):
+    """ComfyUI API 真健康: PID+端口+HTTP JSON 都要过,避免端口假 ready。"""
+    st = svc_status(stype)
+    logf = log_path(stype)
+    detail = {**st, "api_ok": False, "log": logf}
+    if not st["alive_pid"]:
+        detail["error"] = f"{st['name']}进程未运行"
+        return detail
+    if not st["port_up"]:
+        detail["error"] = f"{st['name']}端口 {st['port']} 未监听"
+        return detail
+    last_err = ""
+    for path in ("/system_stats", "/queue"):
+        try:
+            url = f"http://127.0.0.1:{st['port']}{path}"
+            json.load(urllib.request.urlopen(url, timeout=timeout))
+            detail.update(api_ok=True, running=True, path=path, error="")
+            return detail
+        except Exception as e:
+            last_err = str(e)
+    detail["error"] = f"{st['name']}端口已开但 API 未就绪: {last_err}"
+    return detail
 
 def all_status():
     return {t: svc_status(t) for t in ("img", "vid", "llm")}
@@ -111,12 +151,13 @@ ivs_video:
 
 # ---------------- 睡眠保护 ----------------
 def keep_awake(pid):
-    """模型进程活着期间禁止系统睡眠: 锁屏/屏保照常(它们本来就不停进程),
-    但系统不会休眠,CPU/GPU 一直干活; 接电源时合盖也不断活(-s)。
+    """模型进程活着期间禁止系统睡眠,但允许屏保和显示器息屏。
+    ``-i`` 只阻止空闲系统睡眠,不会申请显示器唤醒或
+    ``PreventUserIdleDisplaySleep`` 断言,因此屏保/黑屏仍按系统设置工作。
     caffeinate -w 跟随进程: 进程一死断言自动消失,电脑立刻恢复正常睡眠。
     仅 macOS 有 caffeinate,其他系统静默跳过。"""
     try:
-        subprocess.Popen(["caffeinate", "-is", "-w", str(pid)],
+        subprocess.Popen(["caffeinate", "-i", "-w", str(pid)],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
@@ -136,11 +177,18 @@ def _launch_comfy(stype):
         py = "python3"
     logf = open(s["log"], "ab")
     try:
+        args = [py, "main.py", "--port", str(s["port"]),
+                "--output-directory", COMFY_OUT,
+                "--extra-model-paths-config", YAML_FILE]
+        # 两个 ComfyUI 实例不能抢同一个 comfyui.db；视频实例单独存自己的状态。
+        if stype == "vid":
+            args += ["--database-url", "sqlite:///" + os.path.join(BASE, "comfyui_vid.db")]
         p = subprocess.Popen(
-            [py, "main.py", "--port", str(s["port"]),
-             "--output-directory", COMFY_OUT,
-             "--extra-model-paths-config", YAML_FILE],
-            cwd=comfy_dir, stdout=logf, stderr=subprocess.STDOUT)
+            args,
+            cwd=comfy_dir, stdout=logf, stderr=subprocess.STDOUT,
+            # ComfyUI must survive after the worker/terminal that launched it
+            # exits; otherwise a long model load can be killed with the shell.
+            start_new_session=True)
         open(s["pid"], "w").write(str(p.pid))
         keep_awake(p.pid)   # 生图/生视频跑图期间禁止系统睡眠
         return {"ok": True, "pid": p.pid}
@@ -170,31 +218,78 @@ def _pids_on_port(port):
     except Exception:
         return []
 
+def _llm_ports():
+    """语言模型启用 Codex 代理时，8848 是代理，后端默认退到 8846。"""
+    c = _cfg()
+    public = int(c.get("llm_port", 8848))
+    backend = int(c.get("llm_backend_port", public - 2))
+    return tuple(dict.fromkeys((public, backend)))
+
+def _kill_pid(pid, sig):
+    try:
+        os.kill(int(pid), sig)
+    except (OSError, TypeError, ValueError):
+        pass
+
+def _pid_alive_value(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
 def stop_svc(stype):
-    """彻底停止一类服务: TERM→等8s→KILL→lsof 端口兜底。阻塞直到死透才返回。"""
+    """彻底停止一类服务: TERM→等候→KILL→端口兜底，阻塞直到死透。"""
     s = _services()[stype]
     pid = _read_pid(s["pid"])
+    pids = []
     if pid and pid_alive(s["pid"]):
-        try: os.kill(pid, signal.SIGTERM)
-        except Exception: pass
-        for _ in range(8):
-            if not pid_alive(s["pid"]): break
-            time.sleep(1)
-        if pid_alive(s["pid"]):
-            try: os.kill(pid, signal.SIGKILL)
-            except Exception: pass
-            time.sleep(1)
+        pids.append(pid)
+    # Codex 兼容代理有自己的 PID 文件；llm.pid 记录的是 8846 后端，
+    # 只杀其中一个会留下另一个进程继续占内存。
+    proxy_file = os.path.join(BASE, "llm_proxy.pid") if stype == "llm" else ""
+    proxy_pid = _read_pid(proxy_file) if proxy_file else None
+    if proxy_pid:
+        pids.append(proxy_pid)
+    # vMLX keeps its own PID marker because it runs behind the settings proxy.
+    # Include it even when llm.pid was removed or became stale.
+    vmlx_file = os.path.join(BASE, "vmlx.pid") if stype == "llm" else ""
+    vmlx_pid = _read_pid(vmlx_file) if vmlx_file else None
+    if vmlx_pid:
+        pids.append(vmlx_pid)
+    for child in dict.fromkeys(pids):
+        _kill_pid(child, signal.SIGTERM)
+    for _ in range(8):
+        if not any(_pid_alive_value(child) for child in pids):
+            break
+        time.sleep(1)
+    for child in dict.fromkeys(pids):
+        if _pid_alive_value(child):
+            _kill_pid(child, signal.SIGKILL)
+    if pids:
+        time.sleep(1)
     try: os.remove(s["pid"])
     except OSError: pass
-    # 兜底: 端口还占着(服务不是本程序起的,或 llm 子进程)也一起停
-    for p in _pids_on_port(s["port"]):
-        try: os.kill(p, signal.SIGTERM)
-        except Exception: pass
-    # 阻塞等端口真正释放(最多 6s),确保内存还回来了
+    if proxy_file:
+        try: os.remove(proxy_file)
+        except OSError: pass
+    if vmlx_file:
+        try: os.remove(vmlx_file)
+        except OSError: pass
+    # 兜底: 端口还占着(服务不是本程序起的,或代理/后端子进程)也一起停。
+    ports = _llm_ports() if stype == "llm" else (s["port"],)
+    for port in ports:
+        for child in _pids_on_port(port):
+            _kill_pid(child, signal.SIGTERM)
+    # 阻塞等端口真正释放(最多 8s),确保内存还回来了。
     for _ in range(6):
-        if not port_up(s["port"]): break
+        if not any(port_up(port) for port in ports): break
         time.sleep(1)
-    return {"ok": True, "running": port_up(s["port"])}
+    for port in ports:
+        if port_up(port):
+            for child in _pids_on_port(port):
+                _kill_pid(child, signal.SIGKILL)
+    return {"ok": True, "running": any(port_up(port) for port in ports)}
 
 def stop_others(except_t):
     """内存互斥:停掉 except_t 以外的所有服务,全部死透才返回。"""

@@ -6,7 +6,7 @@
 # 原理: 本程序只是一个"好看的操作台",真正画图的是 ComfyUI。
 #        第一次用请先运行 ./install.sh 装好 ComfyUI,再 ./start.sh 启动。
 # ============================================================
-import json, os, re, shutil, sys, time, threading, urllib.request, urllib.parse, webbrowser, subprocess, platform
+import json, os, re, shutil, sys, time, threading, urllib.request, urllib.parse, urllib.error, webbrowser, subprocess, platform
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 # 本模块所有 urllib 调用都只打 127.0.0.1(ComfyUI/tts/自检),一律不走代理。
@@ -27,6 +27,7 @@ MODELS_IPA = os.path.join(MODELS_IMG, "ipadapter")         # IPAdapter 角色一
 MODELS_CV  = os.path.join(MODELS_IMG, "clip_vision")       # CLIP 视觉编码器(IPAdapter 的眼睛)放这里
 MODELS_VID = os.path.join(BASE, "models", "video")         # 视频模型放这里
 OUT_DIR    = os.path.join(BASE, "output", "images")        # 成品图(网页可直接看)
+HQ_OUT     = os.path.join(BASE, "output", "high_quality") # 高质量工作流归档
 COMFY_OUT  = os.path.join(BASE, "output", "comfy")         # ComfyUI 的临时输出(start.sh 指定)
 MODELS_JSON= os.path.join(BASE, "models.json")             # 已知模型的友好名称/参数(可选)
 
@@ -43,6 +44,10 @@ def default_config():
         "llm_port": 8848,       # 语言模型 llama-server 端口
         "llm_bin": "llama-server",  # llama-server 可执行文件名(PATH 里找)
         "llm_ctx": 32768,       # 语言模型上下文长度
+        # GPT-OSS Metal 独立环境(源码、虚拟环境、权重均在项目 metal/ 下)
+        "metal_repo": "metal/gpt-oss",
+        "metal_venv": "metal/.venv",
+        "metal_checkpoint": "metal/models/gpt-oss-20b/metal/model.bin",
     }
 
 def load_config():
@@ -83,6 +88,11 @@ IMG_PORT, VID_PORT, SELF_PORT = CFG["img_port"], CFG["vid_port"], CFG["port"]
 DIFF_DIR = os.path.join(MODELS_IMG, "diffusion")   # GGUF 主模型(unet)放这里
 ENC_DIR  = os.path.join(MODELS_IMG, "encoder")     # GGUF 文本编码器放这里
 VAE_DIR  = os.path.join(MODELS_IMG, "vae")         # GGUF 的 VAE 放这里
+SD35_FILE = "sd3.5_medium.safetensors"               # SD3.5 Medium 放在 diffusion/ 下
+SD35_CLIPS = ("clip_l.safetensors", "clip_g.safetensors", "t5xxl_fp8_e4m3fn.safetensors")
+# SD3.5 的 VAE 不可使用 Flux 的 split_files/vae/ae.safetensors；这里使用从
+# sd3.5_medium.safetensors 提取出的专用 VAE。
+SD35_VAE = "sd3.5_medium_vae.safetensors"
 LOCAL_JSON = os.path.join(BASE, "models.local.json")
 NOTES_JSON = os.path.join(BASE, "model_notes.json")   # 模型说明书(关键字→擅长领域/速度/内存)
 
@@ -126,10 +136,27 @@ def gguf_ok(e):
     except Exception:
         return False
 
+
+def sd35_ok():
+    """SD3.5 Medium = diffusion 主模型 + 三文本编码器 + VAE 都在才展示。"""
+    return (os.path.exists(os.path.join(DIFF_DIR, SD35_FILE)) and
+            all(os.path.exists(os.path.join(ENC_DIR, c)) for c in SD35_CLIPS) and
+            os.path.exists(os.path.join(VAE_DIR, SD35_VAE)))
+
 def list_models():
-    """可选模型 = models/image 里的单文件 checkpoint + 三件套齐全的 GGUF 模型。"""
+    """可选模型 = SD3.5 专用三件套 + models/image 里的单文件 checkpoint + 三件套齐全的 GGUF。"""
     friendly, ggufs = registry()
     out = []
+    if sd35_ok():
+        meta = friendly.get(SD35_FILE, {})
+        m = {"id": SD35_FILE, "kind": "sd3", "name": meta.get("name", "SD3.5 Medium"),
+             "sec": int(meta.get("sec", 180)),
+             "desc": meta.get("desc", "SD3.5 Medium 专用流·三编码器·文生图/图生图")}
+        note = match_note(SD35_FILE, m["name"])
+        if note: m.update({"field": note.get("field"), "speed": note.get("speed"),
+                           "time": note.get("time"), "mem": note.get("mem"),
+                           "detail": note.get("detail")})
+        out.append(m)
     if os.path.isdir(MODELS_IMG):
         for fn in sorted(os.listdir(MODELS_IMG)):
             fp = os.path.join(MODELS_IMG, fn)
@@ -146,7 +173,7 @@ def list_models():
                 out.append(m)
     for e in ggufs:
         if gguf_ok(e):
-            m = {"id": e["id"], "kind": "gguf",
+            m = {"id": e["id"], "kind": "gguf", "hq_lock": bool(e.get("clip_type") == "sdxl"),
                  "name": e.get("name", e["id"]),
                  "sec": int(e.get("sec", 120)),
                  "desc": e.get("desc", "GGUF 模型")}
@@ -159,6 +186,9 @@ def list_models():
 
 def find_entry(model_id):
     """按 id 找到完整模型定义(生成时用)。"""
+    if model_id == SD35_FILE and sd35_ok():
+        return {"id": SD35_FILE, "kind": "sd3", "sampler":
+                {"steps": 28, "cfg": 5.0, "sampler_name": "euler", "scheduler": "normal"}}
     fp = os.path.join(MODELS_IMG, model_id)
     if os.path.isfile(fp) and model_id.lower().endswith(IMG_EXTS):
         return {"id": model_id, "kind": "checkpoint", "sampler": SAMPLER_DEFAULT}
@@ -201,6 +231,16 @@ def first_clipvision():
 # ---------------- ComfyUI 工作流(checkpoint / GGUF 双架构) ----------------
 def _enc_nodes(e):
     """按模型架构返回 (加载器节点dict, clip接线, vae接线, model接线)。"""
+    if e["kind"] == "sd3":
+        nodes = {
+            "100": {"class_type": "UNETLoader", "inputs": {
+                "unet_name": SD35_FILE, "weight_dtype": "default"}},
+            "101": {"class_type": "TripleCLIPLoader", "inputs": {
+                "clip_name1": SD35_CLIPS[0], "clip_name2": SD35_CLIPS[1],
+                "clip_name3": SD35_CLIPS[2]}},
+            "102": {"class_type": "VAELoader", "inputs": {"vae_name": SD35_VAE}},
+        }
+        return (nodes, ["101", 0], ["102", 0], ["100", 0])
     if e["kind"] == "gguf":
         # 用大编号 100/101/102,避免与 build_wf 里 5~11 的功能节点撞号
         unet_loader = e.get("unet_loader", "UnetLoaderGGUF")
@@ -236,16 +276,24 @@ def build_wf(e, pos, neg, w, h, seed, mode="t2i", ref=None, mask=None,
     loaders, clip_src, vae_src, model_src = _enc_nodes(e)
     cfg = e.get("sampler", SAMPLER_DEFAULT)
     wf = dict(loaders)
-    wf["3"] = {"class_type": "CLIPTextEncode", "inputs": {"text": pos, "clip": clip_src}}
-    wf["4"] = {"class_type": "CLIPTextEncode", "inputs": {"text": neg, "clip": clip_src}}
+    if e["kind"] == "sd3":
+        wf["1s"] = {"class_type": "ModelSamplingSD3", "inputs": {"shift": 3.0, "model": model_src}}
+        model_src = ["1s", 0]
+        wf["3"] = {"class_type": "CLIPTextEncodeSD3", "inputs": {
+            "clip_l": pos, "clip_g": pos, "t5xxl": pos, "empty_padding": "none", "clip": clip_src}}
+        wf["4"] = {"class_type": "CLIPTextEncodeSD3", "inputs": {
+            "clip_l": neg, "clip_g": neg, "t5xxl": neg, "empty_padding": "none", "clip": clip_src}}
+    else:
+        wf["3"] = {"class_type": "CLIPTextEncode", "inputs": {"text": pos, "clip": clip_src}}
+        wf["4"] = {"class_type": "CLIPTextEncode", "inputs": {"text": neg, "clip": clip_src}}
     pos_out = ["3", 0]
     if e.get("flux_guidance"):  # flux 系正向要过 FluxGuidance
         wf["3g"] = {"class_type": "FluxGuidance", "inputs": {"guidance": 3.5, "conditioning": ["3", 0]}}
         pos_out = ["3g", 0]
 
     if ipa:  # 角色一致性(IPAdapter): 参考人物的脸/形象经 CLIP 视觉编码后注入交叉注意力,只换 model 接线
-        if e["kind"] != "checkpoint":
-            raise ValueError("角色一致性(IPAdapter)只支持单文件模型(如 wai / SDXL 系)")
+        if not (e["kind"] == "checkpoint" or e.get("clip_type") == "sdxl"):
+            raise ValueError("角色一致性(IPAdapter)需要 SDXL 模型")
         ipam, cv = first_ipa(), first_clipvision()
         if not ipam or not cv:
             raise ValueError("未找到 IPAdapter 模型或 CLIP 视觉编码器,检查 models/image/ipadapter 和 clip_vision/")
@@ -259,6 +307,8 @@ def build_wf(e, pos, neg, w, h, seed, mode="t2i", ref=None, mask=None,
         model_src = ["1a", 0]
 
     if mode == "inpaint":  # 局部重绘: 只重画涂抹区域
+        if e["kind"] == "sd3":
+            raise ValueError("SD3.5 Medium 当前只支持文生图和图生图，不支持局部重绘")
         wf["6"] = {"class_type": "LoadImage", "inputs": {"image": ref}}
         wf["7"] = {"class_type": "LoadImageMask", "inputs": {"image": mask, "channel": "red"}}
         wf["8"] = {"class_type": "VAEEncodeForInpaint", "inputs": {"pixels": ["6", 0], "vae": vae_src, "mask": ["7", 0], "grow_mask_by": 6}}
@@ -268,6 +318,8 @@ def build_wf(e, pos, neg, w, h, seed, mode="t2i", ref=None, mask=None,
         return wf
 
     if mode == "upscale":  # 放大: 先拉伸再低幅度重绘补细节
+        if e["kind"] == "sd3":
+            raise ValueError("SD3.5 Medium 当前只支持文生图和图生图，不支持放大重绘")
         wf["6"] = {"class_type": "LoadImage", "inputs": {"image": ref}}
         wf["7"] = {"class_type": "ImageScaleBy", "inputs": {"upscale_method": "lanczos", "scale_by": scale, "image": ["6", 0]}}
         wf["8"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["7", 0], "vae": vae_src}}
@@ -304,7 +356,8 @@ def build_wf(e, pos, neg, w, h, seed, mode="t2i", ref=None, mask=None,
         return wf
 
     # t2i 普通文生图(batch>1: 同一提示词一次出N张不同seed,共享CLIP编码,省时间;仅本路径支持批量)
-    wf["5"] = {"class_type": e.get("latent", "EmptyLatentImage"), "inputs": {"width": w, "height": h, "batch_size": max(1, int(batch))}}
+    wf["5"] = {"class_type": "EmptySD3LatentImage" if e["kind"] == "sd3" else e.get("latent", "EmptyLatentImage"),
+               "inputs": {"width": w, "height": h, "batch_size": max(1, int(batch))}}
     wf["6"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": 1.0, "model": model_src, "positive": pos_out, "negative": ["4", 0], "latent_image": ["5", 0]}}
     wf["7"] = {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": vae_src}}
     wf["8"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": "ivs", "images": ["7", 0]}}
@@ -326,7 +379,23 @@ def comfy_post(path, payload, timeout=10):   # 提交类调用(取消/删队列�
 TASKS = {}
 LOCK = threading.Lock()
 
-def submit(model, pos, neg, w, h, name, mode="t2i", ref=None, mask=None, strength=0.6, scale=2.0, ctype="openpose", ipa=None, ipa_weight=0.3, batch=1):
+class ComfyServiceUnavailable(RuntimeError):
+    """ComfyUI 不可连接或尚未就绪。"""
+
+
+def _submit_prompt(req, retries=2):
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            return json.load(urllib.request.urlopen(req, timeout=30))
+        except (urllib.error.URLError, TimeoutError, ConnectionError, ValueError) as e:
+            last = e
+            if attempt < retries:
+                time.sleep(1 + attempt)
+    raise ComfyServiceUnavailable(f"生图服务 {IMG_PORT} 不可用: {last}") from last
+
+
+def submit(model, pos, neg, w, h, name, mode="t2i", ref=None, mask=None, strength=0.6, scale=2.0, ctype="openpose", ipa=None, ipa_weight=0.3, batch=1, timeout=1800, archive=None):
     import random
     e = find_entry(model)
     if not e:
@@ -339,14 +408,16 @@ def submit(model, pos, neg, w, h, name, mode="t2i", ref=None, mask=None, strengt
     req = urllib.request.Request(f"http://127.0.0.1:{IMG_PORT}/prompt",
                                  data=json.dumps({"prompt": wf}).encode(),
                                  headers={"Content-Type": "application/json"})
-    pid = json.load(urllib.request.urlopen(req, timeout=30))["prompt_id"]
+    pid = _submit_prompt(req)["prompt_id"]
     with LOCK:
-        TASKS[pid] = {"name": name, "model": model, "t0": time.time(), "done": False, "error": "", "url": "", "batch": batch, "files": []}
+        TASKS[pid] = {"name": name, "model": model, "t0": time.time(), "done": False,
+                      "error": "", "url": "", "batch": batch, "files": [],
+                      "timeout": max(60, int(timeout)), "archive": archive or ""}
     threading.Thread(target=wait_done, args=(pid,), daemon=True).start()
     return pid
 
 def wait_done(pid):
-    deadline = time.time() + 1800
+    deadline = time.time() + TASKS.get(pid, {}).get("timeout", 1800)
     while time.time() < deadline:
         time.sleep(1)
         try:
@@ -383,6 +454,14 @@ def wait_done(pid):
                 for f in srcs:
                     try: os.remove(f)
                     except OSError: pass
+                archive = TASKS[pid].get("archive", "")
+                if archive:
+                    folder = re.sub(r"[^\w.-]+", "_", str(archive), flags=re.UNICODE).strip("._")[:80] or "round"
+                    adir = os.path.join(HQ_OUT, folder)
+                    os.makedirs(adir, exist_ok=True)
+                    for f in files:
+                        try: shutil.copy2(f, os.path.join(adir, os.path.basename(f)))
+                        except OSError: pass
                 with LOCK:
                     TASKS[pid]["done"] = True
                     TASKS[pid]["files"] = files
@@ -390,7 +469,8 @@ def wait_done(pid):
             else:
                 with LOCK: TASKS[pid]["error"] = "找不到输出文件"
             return
-    with LOCK: TASKS[pid]["error"] = "超时(30分钟)"
+    timeout_min = max(1, round(TASKS.get(pid, {}).get("timeout", 1800) / 60))
+    with LOCK: TASKS[pid]["error"] = f"超时({timeout_min}分钟)"
 
 # ---------------- 预定批量(batch_images.py 的网页版) ----------------
 # 逻辑同 batch_images.py: 逐模型逐提示词提交→轮询等真完成(不是入队就算完)
@@ -1122,13 +1202,217 @@ TEST_CTRL   = os.path.join(TEST_JOBS, "control.json")
 TEST_PIDF   = os.path.join(TEST_JOBS, "worker.pid")
 TEST_OUT    = os.path.join(BASE, "output", "imgtest")
 
-def _test_worker_alive():
+VTEST_JOBS   = os.path.join(BASE, "video_test_jobs")
+VTEST_QUEUE  = os.path.join(VTEST_JOBS, "queue")
+VTEST_PROMPT = os.path.join(VTEST_JOBS, "prompts")
+VTEST_STATUS = os.path.join(VTEST_JOBS, "status.json")
+VTEST_CTRL   = os.path.join(VTEST_JOBS, "control.json")
+VTEST_PIDF   = os.path.join(VTEST_JOBS, "worker.pid")
+VTEST_OUT    = os.path.join(BASE, "output", "vidtest")
+VTEST_SPAWN_LOCK = threading.Lock()
+
+def _test_safe_folder(raw, fallback):
+    """生成跨平台安全的目录名：保留文字、数字、下划线和连字符。"""
+    for value in (raw, fallback, "model"):
+        name = re.sub(r"[^\w-]+", "_", str(value or "").strip(), flags=re.UNICODE)
+        name = re.sub(r"_+", "_", name).strip("_")[:80].rstrip("_")
+        if name:
+            return name
+    return "model"
+
+
+def _test_clean_models(models):
+    """清洗测试场目录名，并避免两个模型写进同一个目录。"""
+    clean = []
+    used = set()
+    for index, model in enumerate(models, 1):
+        mm = dict(model)
+        base = _test_safe_folder(mm.get("folder"), mm.get("name") or mm.get("id") or f"model_{index}")
+        folder = base
+        suffix = 2
+        while folder.casefold() in used:
+            tail = f"_{suffix}"
+            folder = base[:80 - len(tail)].rstrip("_") + tail
+            suffix += 1
+        used.add(folder.casefold())
+        mm["folder"] = folder
+        clean.append(mm)
+    return clean
+
+
+def _test_safe_suffix(raw):
+    """统一命名后缀；保留用户输入的 - 或 _，没有分隔符时默认加 _。"""
+    raw_text = str(raw or "").strip()
+    name = re.sub(r"[^\w-]+", "_", raw_text, flags=re.UNICODE)
+    name = re.sub(r"_+", "_", name)
+    name = re.sub(r"-+", "-", name).strip("_-")[:40].rstrip("_-")
+    if not name:
+        return ""
+    return ("-" if raw_text.startswith("-") else "_") + name
+
+
+def _video_folder_taken(folder, reserved=None):
+    """判断视频任务文件夹是否已被旧任务或磁盘上的成片占用。"""
+    key = str(folder or "").casefold()
+    if not key:
+        return True
+    if key in (reserved or set()):
+        return True
+    if os.path.isdir(os.path.join(VTEST_OUT, folder)):
+        return True
+    if not os.path.isdir(VTEST_QUEUE):
+        return False
+    for filename in os.listdir(VTEST_QUEUE):
+        if not filename.endswith(".json"):
+            continue
+        try:
+            task = json.load(open(os.path.join(VTEST_QUEUE, filename), encoding="utf-8"))
+        except Exception:
+            continue
+        for model in task.get("models", []):
+            actual = model.get("output_folder") or model.get("folder")
+            if str(actual or "").casefold() == key:
+                return True
+    return False
+
+
+def _video_unique_folder(candidate, reserved):
+    """同名任务自动变成 _v2、_v3；已有 _vN 时继续递增。"""
+    candidate = _test_safe_folder(candidate, "video")
+    if not _video_folder_taken(candidate, reserved):
+        reserved.add(candidate.casefold())
+        return candidate
+    match = re.match(r"^(.*)_v(\d+)$", candidate, flags=re.I)
+    root, version = (match.group(1), int(match.group(2)) + 1) if match else (candidate, 2)
+    while True:
+        folder = _test_safe_folder(f"{root}_v{version}", "video")
+        if not _video_folder_taken(folder, reserved):
+            reserved.add(folder.casefold())
+            return folder
+        version += 1
+
+
+def _video_allocate_folders(models, suffix=""):
+    """给每个模型分配本任务独占的成片文件夹，避免不同任务互相覆盖。"""
+    reserved = set()
+    allocated = []
+    for model in models:
+        item = dict(model)
+        base = _test_safe_folder(item.get("base_folder") or item.get("folder"),
+                                 item.get("name") or item.get("id") or "video")
+        candidate = base + suffix if suffix and not base.endswith(suffix) else base
+        item["base_folder"] = base
+        item["output_folder"] = _video_unique_folder(candidate, reserved)
+        item["folder"] = base
+        allocated.append(item)
+    return allocated
+
+
+def _video_safe_remove(path, roots):
+    """只允许删除视频任务自己拥有的文件或目录。"""
+    if not path:
+        return
+    absolute = os.path.realpath(path)
+    if not any(absolute == root or absolute.startswith(root + os.sep) for root in roots):
+        return
+    if os.path.isdir(absolute) and not os.path.islink(absolute):
+        shutil.rmtree(absolute, ignore_errors=True)
+    elif os.path.exists(absolute):
+        try:
+            os.remove(absolute)
+        except OSError:
+            pass
+
+
+def _video_delete_outputs(task):
+    """删除最终成片、分段工作区和旧版 _segments 目录，空模型目录也一并移除。"""
+    output_root = os.path.realpath(VTEST_OUT)
+    work_root = os.path.realpath(os.path.join(VTEST_JOBS, "work"))
+    roots = (output_root, work_root)
+    for path in task.get("outputs", []):
+        _video_safe_remove(os.path.join(BASE, path), roots)
+    segment_paths = []
+    for group in task.get("segments", []) or []:
+        segment_paths.extend(group if isinstance(group, list) else [group])
+    for path in segment_paths:
+        if not isinstance(path, str):
+            continue
+        absolute = os.path.realpath(os.path.join(BASE, path))
+        parent = os.path.dirname(absolute)
+        if absolute.startswith(work_root + os.sep) or os.path.basename(parent).endswith("_segments"):
+            _video_safe_remove(parent, roots)
+        else:
+            _video_safe_remove(absolute, roots)
+    for path in task.get("legacy_work_dirs", []):
+        _video_safe_remove(os.path.join(BASE, path), roots)
+    _video_safe_remove(os.path.join(BASE, task.get("work_dir", "")), roots)
+    for folder in task.get("output_dirs", []):
+        absolute = os.path.realpath(os.path.join(BASE, folder))
+        if absolute.startswith(output_root + os.sep) and os.path.isdir(absolute):
+            try:
+                os.rmdir(absolute)
+            except OSError:
+                pass
+
+
+def _pidfile_alive(pidfile):
     try:
-        pid = int(open(TEST_PIDF).read().strip())
-        os.kill(pid, 0)   # 不真杀,只探活
+        pid = int(open(pidfile).read().strip())
+        os.kill(pid, 0)
         return True
     except Exception:
         return False
+
+
+def _queue_has_running(queue_dir):
+    if not os.path.isdir(queue_dir):
+        return False
+    for fn in os.listdir(queue_dir):
+        if not fn.endswith(".json"):
+            continue
+        try:
+            if json.load(open(os.path.join(queue_dir, fn), encoding="utf-8")).get("state") == "running":
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _comfy_queue_busy(stype):
+    """检查真实 ComfyUI 队列，覆盖普通生图/生视频页面提交的任务。"""
+    try:
+        status = svc.svc_status(stype)
+        if not status.get("port_up"):
+            return False
+        data = json.load(urllib.request.urlopen(f"http://127.0.0.1:{status['port']}/queue", timeout=3))
+        return bool(data.get("queue_running") or data.get("queue_pending"))
+    except Exception:
+        return False
+
+
+def _test_conflict(want):
+    """图片测试和视频测试绝不同时跑，避免两套大模型一起占满内存。"""
+    if want == "image":
+        other_name, pidf, queue, own_pidf, own_svc, other_svc = (
+            "视频", VTEST_PIDF, VTEST_QUEUE, TEST_PIDF, "img", "vid")
+    else:
+        other_name, pidf, queue, own_pidf, own_svc, other_svc = (
+            "图片", TEST_PIDF, TEST_QUEUE, VTEST_PIDF, "vid", "img")
+    if _pidfile_alive(pidf) or _queue_has_running(queue):
+        return {"error": f"{other_name}测试后台任务正在运行，请先停止它再启动当前测试",
+                "error_code": "test_worker_conflict", "conflict": other_name + "测试"}
+    if _comfy_queue_busy(other_svc):
+        return {"error": f"后台还有{other_name}生成任务正在计算，请等它完成或手动停止后再启动当前测试",
+                "error_code": "test_worker_conflict", "conflict": other_name + "生成"}
+    # 同一种测试 worker 活着时允许继续追加计划；否则普通页面提交的同类任务也要先跑完。
+    if not _pidfile_alive(own_pidf) and _comfy_queue_busy(own_svc):
+        label = "图片" if want == "image" else "视频"
+        return {"error": f"后台还有普通{label}任务正在计算，请等它完成后再启动测试",
+                "error_code": "test_worker_conflict", "conflict": label + "生成"}
+    return None
+
+def _test_worker_alive():
+    return _pidfile_alive(TEST_PIDF)
 
 def _test_spawn():
     """worker 没在跑就派生一个(脱离本进程组,独立存活)。"""
@@ -1137,9 +1421,10 @@ def _test_spawn():
     for d in (TEST_QUEUE, TEST_PROMPT, TEST_OUT):
         os.makedirs(d, exist_ok=True)
     logf = open(os.path.join(TEST_JOBS, "worker.log"), "ab")
-    subprocess.Popen([sys.executable, os.path.join(BASE, "test_worker.py")],
-                     stdout=logf, stderr=subprocess.STDOUT,
-                     cwd=BASE, start_new_session=True)
+    p = subprocess.Popen([sys.executable, os.path.join(BASE, "test_worker.py")],
+                         stdout=logf, stderr=subprocess.STDOUT,
+                         cwd=BASE, start_new_session=True)
+    open(TEST_PIDF, "w").write(str(p.pid))
 
 def test_state():
     """测试中心首页数据: 模型清单 + refs + 任务队列 + worker 实时状态。"""
@@ -1162,6 +1447,9 @@ def test_state():
 
 def test_create(cfg):
     """建一个测试任务: 写 queue/NNN.json + prompts/NNN.txt,然后确保 worker 在跑(排队)。"""
+    conflict = _test_conflict("image")
+    if conflict:
+        return conflict
     models = cfg.get("models", [])
     prompts = [p.strip() for p in cfg.get("prompts", []) if p.strip()]
     if not models:
@@ -1174,10 +1462,13 @@ def test_create(cfg):
     nid = f"{(max([int(f[:3]) for f in existing if f[:3].isdigit()] or [0]) + 1):03d}"
     pf = os.path.join(TEST_PROMPT, nid + ".txt")
     open(pf, "w", encoding="utf-8").write("\n".join(prompts) + "\n")
+    clean_models = _test_clean_models(models)
     task = {"id": nid, "state": "queued", "created": time.time(),
-            "models": models, "canvas": cfg.get("canvas", {"w": 832, "h": 1216}),
+            "models": clean_models, "canvas": cfg.get("canvas", {"w": 832, "h": 1216}),
             "per_prompt": max(1, min(10, int(cfg.get("per_prompt", 1)))),
             "prompts_file": os.path.relpath(pf, BASE),
+            "folder_suffix": _test_safe_suffix(cfg.get("folder_suffix")),
+            "file_suffix": _test_safe_suffix(cfg.get("file_suffix")),
             "pad_ref": cfg.get("pad_ref") or "",
             "face_lock": cfg.get("face_lock") or {}}
     json.dump(task, open(os.path.join(TEST_QUEUE, nid + ".json"), "w", encoding="utf-8"),
@@ -1187,11 +1478,15 @@ def test_create(cfg):
 
 def test_rerun(tid):
     """原样重跑: 把已有任务(配置+提示词)复制成一个新任务进队列。"""
+    conflict = _test_conflict("image")
+    if conflict:
+        return conflict
     tid = re.sub(r"\D", "", tid or "")
     src = os.path.join(TEST_QUEUE, tid + ".json")
     if not os.path.exists(src):
         return {"error": "找不到任务 " + tid}
     t = json.load(open(src, encoding="utf-8"))
+    t["models"] = _test_clean_models(t.get("models", []))
     pf = os.path.join(BASE, t.get("prompts_file", ""))
     prompts = open(pf, encoding="utf-8").read() if os.path.exists(pf) else ""
     existing = [f for f in os.listdir(TEST_QUEUE) if f.endswith(".json")]
@@ -1239,6 +1534,325 @@ def test_prompts_save(tid, text):
     pf = os.path.join(TEST_PROMPT, tid + ".txt")
     if not os.path.exists(pf):
         return {"error": "任务不存在(可能已删除)"}
+    open(pf, "w", encoding="utf-8").write(text)
+    return {"ok": True}
+
+
+# ---------------- 视频测试场(独立后台 worker) ----------------
+def _video_test_worker_alive():
+    return _pidfile_alive(VTEST_PIDF)
+
+
+def _video_test_has_queued():
+    """队列里是否还有真正等着运行的视频任务。"""
+    if not os.path.isdir(VTEST_QUEUE):
+        return False
+    for filename in os.listdir(VTEST_QUEUE):
+        if not filename.endswith(".json"):
+            continue
+        try:
+            task = json.load(open(os.path.join(VTEST_QUEUE, filename), encoding="utf-8"))
+            if task.get("state") == "queued":
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _video_test_spawn():
+    with VTEST_SPAWN_LOCK:
+        if _video_test_worker_alive():
+            return
+        for d in (VTEST_QUEUE, VTEST_PROMPT, VTEST_OUT):
+            os.makedirs(d, exist_ok=True)
+        logf = open(os.path.join(VTEST_JOBS, "worker.log"), "ab")
+        p = subprocess.Popen([sys.executable, os.path.join(BASE, "video_test_worker.py")],
+                             stdout=logf, stderr=subprocess.STDOUT,
+                             cwd=BASE, start_new_session=True)
+        open(VTEST_PIDF, "w").write(str(p.pid))
+
+
+def _video_test_wake_queue():
+    """worker 意外退出或前一个任务被删后，自动接着跑剩余队列。"""
+    if _video_test_worker_alive() or not _video_test_has_queued():
+        return False
+    if _test_conflict("video"):
+        return False
+    _video_test_spawn()
+    return True
+
+
+def _read_video_task_state(filename):
+    try:
+        return json.load(open(os.path.join(VTEST_QUEUE, filename), encoding="utf-8")).get("state")
+    except Exception:
+        return ""
+
+
+def _video_task_total(task):
+    """为旧任务补算总成片数，方便断点页面显示。"""
+    prompts_file = os.path.join(BASE, task.get("prompts_file", ""))
+    try:
+        prompt_count = len([line for line in open(prompts_file, encoding="utf-8") if line.strip()])
+    except Exception:
+        prompt_count = 1
+    ref_count = 1 if task.get("mode") == "t2v" else max(1, len(task.get("refs") or []))
+    return (len(task.get("models") or []) * prompt_count * ref_count *
+            max(1, len(task.get("variants") or [])) * max(1, int(task.get("copies", 1))))
+
+
+def _video_timing(task, progress):
+    """根据任务实际开始时间和已完成成片数，计算本次任务的平均速度。"""
+    started = float(task.get("started") or 0)
+    finished = float(task.get("finished") or 0)
+    now = finished if finished and task.get("state") in ("done", "partial", "failed", "killed") else time.time()
+    elapsed = max(0, now - started) if started else 0
+    done = max(0, int(progress.get("done") or 0))
+    total = max(0, int(progress.get("total") or task.get("total") or _video_task_total(task)))
+    average = elapsed / done if done else 0
+    return {"elapsed_sec": round(elapsed), "done": done, "total": total,
+            "average_sec": round(average) if average else 0,
+            "remaining_sec": round(average * max(0, total - done)) if average else 0}
+
+
+def video_test_state():
+    # 页面轮询时顺手修复“有排队任务但 worker 已退出”的状态。
+    _video_test_wake_queue()
+    tasks = []
+    model_samples = {}
+    worker_alive = _video_test_worker_alive()
+    if os.path.isdir(VTEST_QUEUE):
+        for fn in sorted(os.listdir(VTEST_QUEUE)):
+            if fn.endswith(".json"):
+                try:
+                    task = json.load(open(os.path.join(VTEST_QUEUE, fn), encoding="utf-8"))
+                    view = dict(task)
+                    resumable_state = task.get("state") in (
+                        "running", "paused", "interrupted", "killed", "partial", "failed")
+                    view["resume_available"] = bool((not worker_alive) and resumable_state and
+                                                    (task.get("started") or task.get("outputs") or
+                                                     task.get("checkpoint")))
+                    if view["resume_available"] and task.get("state") in ("running", "paused"):
+                        view["state"] = "interrupted"
+                    progress = dict(task.get("progress") or {})
+                    if not progress:
+                        progress = {"done": len(task.get("outputs") or []),
+                                    "total": task.get("total") or _video_task_total(task)}
+                    elif not progress.get("total"):
+                        progress["total"] = task.get("total") or _video_task_total(task)
+                    view["progress"] = progress
+                    view["timing"] = _video_timing(task, progress)
+                    for sample in task.get("timings") or []:
+                        try:
+                            if not sample.get("ok", True):
+                                continue
+                            count = max(1, int(sample.get("segment_count") or 1))
+                            elapsed = float(sample.get("elapsed_sec") or 0) / count
+                            if elapsed > 0:
+                                model_samples.setdefault(str(sample.get("model_id") or ""), []).append(elapsed)
+                        except Exception:
+                            continue
+                    tasks.append(view)
+                except Exception:
+                    pass
+    status = {}
+    try:
+        status = json.load(open(VTEST_STATUS, encoding="utf-8"))
+    except Exception:
+        pass
+    models = []
+    for model in vidwf.list_unets():
+        item = dict(model)
+        samples = model_samples.get(str(item.get("id") or ""), [])
+        if samples:
+            item["actual_average_sec"] = round(sum(samples) / len(samples))
+            item["actual_samples"] = len(samples)
+        models.append(item)
+    return {"models": models, "loras": vidwf.list_loras(),
+            "refs": list_refs()["refs"], "tasks": tasks, "status": status,
+            "worker_alive": _video_test_worker_alive(), "out_base": "output/vidtest/",
+            "work_base": "video_test_jobs/work/", "prompt_dir": "video_test_jobs/prompts/"}
+
+
+def _video_test_variants(raw):
+    out = []
+    for v in (raw or [])[:30]:
+        try:
+            w = max(64, min(1920, (int(v.get("w", 360)) // 16) * 16))
+            h = max(64, min(1920, (int(v.get("h", 640)) // 16) * 16))
+            duration = max(0.5, min(300.0, float(v.get("duration", 2))))
+            fps = max(1.0, min(120.0, float(v.get("fps", 24))))
+            item = {"w": w, "h": h, "duration": duration, "fps": fps}
+            if item not in out:
+                out.append(item)
+        except Exception:
+            pass
+    return out or [{"w": 360, "h": 640, "duration": 2, "fps": 24}]
+
+
+def _video_source_frames(duration, target_fps):
+    """高帧率是成片目标；模型统一最多按24fps生成，再由 ffmpeg 补帧。"""
+    raw = max(9, round(float(duration) * min(24.0, float(target_fps))))
+    return max(9, round((raw - 1) / 8) * 8 + 1)
+
+
+def video_test_create(cfg):
+    conflict = _test_conflict("video")
+    if conflict:
+        return conflict
+    models = _test_clean_models(cfg.get("models", []))
+    prompts = [str(p).strip() for p in cfg.get("prompts", []) if str(p).strip()]
+    mode = "t2v" if cfg.get("mode") == "t2v" else "i2v"
+    refs = []
+    for name in cfg.get("refs", []):
+        name = os.path.basename(str(name))
+        if name and os.path.isfile(os.path.join(REFS_DIR, name)) and name not in refs:
+            refs.append(name)
+    if not models:
+        return {"error": "至少选一个视频模型"}
+    if not prompts:
+        return {"error": "至少写一条提示词"}
+    if mode == "i2v" and not refs:
+        return {"error": "图生视频至少选择一张垫图"}
+    variants = _video_test_variants(cfg.get("variants"))
+    for d in (VTEST_QUEUE, VTEST_PROMPT, VTEST_OUT):
+        os.makedirs(d, exist_ok=True)
+    existing = [f for f in os.listdir(VTEST_QUEUE) if f.endswith(".json")]
+    nid = f"{(max([int(f[:3]) for f in existing if f[:3].isdigit()] or [0]) + 1):03d}"
+    pf = os.path.join(VTEST_PROMPT, nid + ".txt")
+    open(pf, "w", encoding="utf-8").write("\n".join(prompts) + "\n")
+    folder_suffix = _test_safe_suffix(cfg.get("folder_suffix"))
+    models = _video_allocate_folders(models, folder_suffix)
+    raw_loras = cfg.get("loras")
+    if raw_loras is None:
+        raw_loras = [cfg.get("lora", "none")]
+    if isinstance(raw_loras, str):
+        raw_loras = [raw_loras]
+    known_loras = {str(item.get("id")) for item in vidwf.list_loras() if item.get("id") != "none"}
+    selected_loras = []
+    for item in raw_loras or []:
+        item = str(item)
+        if item in known_loras and item not in selected_loras:
+            selected_loras.append(item)
+    task = {"id": nid, "state": "queued",
+            "created": time.time(), "models": models,
+            "mode": mode, "refs": refs, "variants": variants,
+            "copies": max(1, min(10, int(cfg.get("copies", 1)))),
+            "prompts_file": os.path.relpath(pf, BASE),
+            "folder_suffix": folder_suffix,
+            "file_suffix": _test_safe_suffix(cfg.get("file_suffix")),
+            "lora": selected_loras[0] if selected_loras else "none",
+            "loras": selected_loras,
+            "stg": bool(cfg.get("stg", False)),
+            "interpolate": bool(cfg.get("interpolate", False)),
+            "native_audio": bool(cfg.get("native_audio", False)),
+            "style_2d": bool(cfg.get("style_2d", False)), "auto_segment": True}
+    json.dump(task, open(os.path.join(VTEST_QUEUE, nid + ".json"), "w", encoding="utf-8"), ensure_ascii=False)
+    _video_test_spawn()
+    return {"ok": True, "id": nid, "waiting": False}
+
+
+def video_test_rerun(tid):
+    conflict = _test_conflict("video")
+    if conflict:
+        return conflict
+    tid = re.sub(r"\D", "", tid or "")
+    src = os.path.join(VTEST_QUEUE, tid + ".json")
+    if not os.path.exists(src):
+        return {"error": "找不到视频任务 " + tid}
+    t = json.load(open(src, encoding="utf-8"))
+    pf = os.path.join(BASE, t.get("prompts_file", ""))
+    prompts = open(pf, encoding="utf-8").read() if os.path.exists(pf) else ""
+    existing = [f for f in os.listdir(VTEST_QUEUE) if f.endswith(".json")]
+    nid = f"{(max([int(f[:3]) for f in existing if f[:3].isdigit()] or [0]) + 1):03d}"
+    npf = os.path.join(VTEST_PROMPT, nid + ".txt")
+    open(npf, "w", encoding="utf-8").write(prompts)
+    base_models = []
+    for model in t.get("models", []):
+        item = dict(model)
+        item["folder"] = item.get("base_folder") or item.get("folder") or item.get("name")
+        item.pop("output_folder", None)
+        base_models.append(item)
+    t["models"] = _video_allocate_folders(_test_clean_models(base_models), t.get("folder_suffix", ""))
+    t.update({"id": nid, "state": "queued", "created": time.time(),
+              "prompts_file": os.path.relpath(npf, BASE), "outputs": [], "segments": [],
+              "completed_items": [], "checkpoint": {}, "progress": {},
+              "resume_available": False})
+    for key in ("started", "finished", "ok", "fail", "total", "error", "error_code"):
+        t.pop(key, None)
+    json.dump(t, open(os.path.join(VTEST_QUEUE, nid + ".json"), "w", encoding="utf-8"), ensure_ascii=False)
+    _video_test_spawn()
+    return {"ok": True, "id": nid}
+
+
+def video_test_control(cmd):
+    os.makedirs(VTEST_JOBS, exist_ok=True)
+    if cmd not in ("pause", "resume", "kill_curr", "kill_all"):
+        return {"error": "未知控制令: " + cmd}
+    json.dump({"cmd": cmd}, open(VTEST_CTRL, "w", encoding="utf-8"))
+    return {"ok": True, "cmd": cmd}
+
+
+def video_test_resume(tid):
+    """把上次中断的任务重新排回视频队列，worker 会按断点跳过已完成成片。"""
+    conflict = _test_conflict("video")
+    if conflict:
+        return conflict
+    tid = re.sub(r"\D", "", tid or "")
+    path = os.path.join(VTEST_QUEUE, tid + ".json")
+    if not os.path.exists(path):
+        return {"error": "找不到视频任务 " + tid}
+    try:
+        task = json.load(open(path, encoding="utf-8"))
+    except Exception as exc:
+        return {"error": "读取视频任务失败: " + str(exc)}
+    if _video_test_worker_alive():
+        return {"error": "视频后台正在运行，请等当前队列处理到这个任务"}
+    if task.get("state") == "done":
+        return {"error": "这个视频任务已经完成"}
+    task.update(state="queued", resume_requested=True, resume_available=False,
+                resumed_at=time.time())
+    json.dump(task, open(path, "w", encoding="utf-8"), ensure_ascii=False)
+    _video_test_spawn()
+    return {"ok": True, "id": tid}
+
+
+def video_test_delete(tid):
+    tid = re.sub(r"\D", "", tid or "")
+    task_path = os.path.join(VTEST_QUEUE, tid + ".json")
+    task = {}
+    if os.path.exists(task_path):
+        try:
+            task = json.load(open(task_path, encoding="utf-8"))
+        except Exception:
+            task = {}
+    if task.get("state") in ("queued", "running") and _video_test_worker_alive():
+        return {"error": "任务正在后台运行，请先暂停并停止视频 worker 后再删除", "error_code": "video_task_running"}
+    _video_delete_outputs(task)
+    for p in (task_path, os.path.join(VTEST_PROMPT, tid + ".txt")):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
+    _video_test_wake_queue()
+    return {"ok": True}
+
+
+def video_test_prompts_get(tid):
+    tid = re.sub(r"\D", "", tid or "")
+    pf = os.path.join(VTEST_PROMPT, tid + ".txt")
+    if not os.path.exists(pf):
+        return {"error": "没有这个视频任务的提示词"}
+    return {"ok": True, "id": tid, "path": "video_test_jobs/prompts/" + tid + ".txt",
+            "text": open(pf, encoding="utf-8").read()}
+
+
+def video_test_prompts_save(tid, text):
+    tid = re.sub(r"\D", "", tid or "")
+    pf = os.path.join(VTEST_PROMPT, tid + ".txt")
+    if not os.path.exists(pf):
+        return {"error": "视频任务不存在(可能已删除)"}
     open(pf, "w", encoding="utf-8").write(text)
     return {"ok": True}
 
@@ -1553,6 +2167,20 @@ img.out{max-width:100%;border-radius:14px;margin-top:13px;box-shadow:var(--shado
 img.mask{filter:blur(18px)}
 .row{display:flex;gap:11px;align-items:center;flex-wrap:wrap}
 .small{font-size:12.5px;color:var(--faint);line-height:1.55}
+.vid-workspace{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:22px;align-items:start}
+.vid-main{min-width:0}
+.vid-side{position:sticky;top:18px;min-width:0;border-left:1px solid var(--border);padding-left:18px}
+.vid-side-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:2px 0 10px}
+.vid-side-head b{font-size:14px}.vid-side-head button{padding:6px 10px;border-radius:8px;font-size:12px}
+.vid-task-group{margin:13px 0 6px;color:var(--muted);font-size:12px;font-weight:700}
+.vid-task{border:1px solid var(--border);background:var(--card);border-radius:8px;padding:10px 11px;margin:8px 0;box-shadow:var(--shadow-sm)}
+.vid-task:hover{border-color:var(--border-hi)}
+.vid-task-title{font-size:13px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.vid-task-meta{font-size:11.5px;color:var(--faint);margin:4px 0 8px;line-height:1.45}
+.vid-task-actions{display:flex;gap:7px}.vid-task-actions button{min-height:30px;padding:5px 10px;border-radius:7px;font-size:12px;box-shadow:none}
+.vid-state{font-size:11px;font-weight:700}.vid-state.running{color:var(--on)}.vid-state.queued{color:var(--accent)}.vid-state.failed{color:#d03050}
+.vid-empty{padding:18px 10px;text-align:center;color:var(--faint);font-size:12px;border:1px dashed var(--border);border-radius:8px}
+.vid-detail{max-width:760px;margin:0 auto}.vid-detail video{display:block;width:100%;max-height:70vh;background:#000;border-radius:8px}
 .drop{border:2px dashed var(--border);border-radius:14px;padding:20px;text-align:center;color:var(--faint);
   font-size:13px;cursor:pointer;background:var(--input);transition:.18s}
 .drop:hover{border-color:var(--border-hi);color:var(--accent)}
@@ -1564,6 +2192,14 @@ code{background:var(--chip-bg);border-radius:6px;padding:2px 8px;font-size:13px;
   border:1px solid var(--chip-bd)}
 input[type=range]{accent-color:var(--accent);height:22px}
 input[type=radio],input[type=checkbox]{accent-color:var(--accent);width:15px;height:15px}
+.proxy-switch{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:3px;padding:3px;margin:8px 0 5px;
+  background:var(--input);border:1px solid var(--border);border-radius:8px;box-shadow:inset 0 1px 2px rgba(20,30,70,.08)}
+.proxy-switch button{min-width:0;padding:8px 10px;border:0;border-radius:6px;background:transparent;color:var(--muted);
+  font-size:13px;font-weight:600;box-shadow:none;transform:none;transition:background .16s,color .16s,box-shadow .16s}
+.proxy-switch button::after{display:none}
+.proxy-switch button:hover{background:var(--card-sel);color:var(--text);box-shadow:none;filter:none}
+.proxy-switch button.active{background:var(--accent);color:#fff;box-shadow:0 2px 7px rgba(70,100,220,.28)}
+.proxy-switch button.active:hover{background:var(--accent);color:#fff;filter:brightness(1.05)}
 .tags{display:flex;flex-wrap:wrap;gap:6px;margin:2px 0 6px}
 .tag{padding:4px 12px;border-radius:999px;background:var(--chip-bg);border:1px solid var(--chip-bd);
   font-size:12px;cursor:pointer;user-select:none;color:var(--chip-tx);transition:.15s}
@@ -1676,6 +2312,34 @@ body.tech .card:hover{box-shadow:var(--shadow-md),0 0 20px rgba(34,211,238,.18)}
 body.tech .card.sel{box-shadow:var(--shadow-md),0 0 22px rgba(34,211,238,.3)}
 body.tech #themePanel .thopt:hover{box-shadow:0 0 12px rgba(34,211,238,.3)}
 body.tech::before,body.tech::after{opacity:.06}
+/* ============ 主题: GitHub · 夜间科技(body.github) ============ */
+body.github{
+  color-scheme:dark;
+  --bg:radial-gradient(900px 560px at 88% -12%,rgba(255,174,52,.22),transparent 58%),
+       radial-gradient(760px 520px at -8% 110%,rgba(255,107,0,.16),transparent 56%),
+       linear-gradient(150deg,#0b0b0f 0%,#16110b 52%,#090806 100%);
+  --card:#1c1710; --card-sel:#2a1d0e; --border:#3a2a18; --border-hi:#f59e0b;
+  --text:#f5e7c8; --muted:#c6a46c; --faint:#856b42;
+  --input:#120f0b; --accent:#f59e0b; --accent2:#ff6b00;
+  --grad:linear-gradient(120deg,#ffd166,#f59e0b 52%,#ff6b00);
+  --btn-grad:linear-gradient(120deg,#ffcc4d 0%,#f59e0b 48%,#ff6b00 100%);
+  --shadow-sm:0 1px 2px rgba(0,0,0,.55),0 0 10px rgba(245,158,11,.08);
+  --shadow-md:0 10px 34px rgba(0,0,0,.62),0 0 22px rgba(245,158,11,.2);
+  --chip-bg:#2b1f0f; --chip-bd:#5a3b11; --chip-tx:#ffd166;
+  --box-bg:#271b0c; --box-bd:#6b420d; --box-tx:#f2d28a;
+  --mem-bg:#271b0c; --mem-bd:#6b420d; --mem-tx:#ffc65a;
+  --on:#fbbf24; --off:#7c6a4a;
+  --glass:rgba(18,14,8,.78);
+}
+body.github button{box-shadow:0 0 15px rgba(245,158,11,.34),0 0 30px rgba(255,107,0,.12),inset 0 1px 0 rgba(255,255,255,.22)}
+body.github button:hover{filter:brightness(1.12);box-shadow:0 0 24px rgba(245,158,11,.62),0 0 46px rgba(255,107,0,.24),inset 0 1px 0 rgba(255,255,255,.25)}
+body.github .back:hover,body.github .mini:hover,body.github .tab:hover,body.github .tag:hover,body.github .drop:hover,body.github #themePanel .thopt:hover{box-shadow:0 0 16px rgba(245,158,11,.28)}
+body.github .card:hover{box-shadow:var(--shadow-md),0 0 24px rgba(245,158,11,.28);border-color:var(--border-hi)}
+body.github .card.sel,body.github .tab.on,body.github .tag.on{box-shadow:0 0 24px rgba(245,158,11,.34)}
+body.github textarea:focus,body.github input:focus,body.github select:focus{box-shadow:0 0 0 4px rgba(245,158,11,.2),0 0 18px rgba(245,158,11,.2)}
+body.github::before,body.github::after{opacity:.07}
+body.github #fxLayer .grid{opacity:.62}
+body.github #fxLayer .github-hole-canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
 /* ============ 主题4: 绵羊·暖白(body.sheep) ============ */
 body.sheep{
   --bg:linear-gradient(165deg,#f4f0e6 0%,#f0ead9 52%,#e8efe2 100%);
@@ -1693,6 +2357,48 @@ body.sheep{
   --glass:rgba(255,253,245,.8);
 }
 body.sheep::before,body.sheep::after{opacity:.35}
+/* ============ 主题5: 向日葵·农家乐(body.sunny，覆盖原薄荷主题) ============ */
+body.sunny{
+  --bg:linear-gradient(180deg,#fff1bc 0%,#ffe4a0 38%,#f6c875 67%,#b8753e 100%);
+  --card:#fffdf5; --card-sel:#fff0bd; --border:#d9a84f; --border-hi:#a95d20;
+  --text:#352214; --muted:#604023; --faint:#735234;
+  --input:#fff8e8; --accent:#c8752d; --accent2:#e49a27;
+  --grad:linear-gradient(120deg,#f4b52d,#d97824 58%,#9c542f);
+  --btn-grad:linear-gradient(120deg,#f3bd3c 0%,#df8327 58%,#a95b32 100%);
+  --shadow-sm:0 1px 2px rgba(111,64,24,.12),0 4px 14px rgba(111,64,24,.1);
+  --shadow-md:0 12px 32px rgba(94,52,20,.18),0 3px 12px rgba(94,52,20,.12);
+  --chip-bg:#fff0c2; --chip-bd:#e8c879; --chip-tx:#8d5a24;
+  --box-bg:#fffaf0; --box-bd:#dbae59; --box-tx:#4f351c;
+  --mem-bg:#fff0c9; --mem-bd:#e3bd6b; --mem-tx:#8b5d25;
+  --on:#6c9a42; --off:#ae9879;
+  --glass:rgba(255,253,245,.97);
+}
+body.sunny::before{opacity:.08;background:radial-gradient(42% 28% at 50% 0%,rgba(255,255,226,.9),transparent 72%)}
+body.sunny::after{opacity:.16;background:linear-gradient(180deg,transparent 42%,rgba(126,69,32,.22) 100%)}
+body.sunny .card:hover{box-shadow:var(--shadow-md),0 0 18px rgba(220,133,35,.2);border-color:var(--border-hi)}
+body.sunny button:hover,body.sunny .tab.on{box-shadow:0 5px 18px rgba(199,111,34,.24)}
+body.sunny .small{color:var(--muted)}
+body.sunny h2,body.sunny h3{color:#3f2918;text-shadow:0 1px 0 rgba(255,255,255,.75)}
+/* 农场壁纸：太阳缓慢横向移动，田垄和作物保持克制的装饰感 */
+#fxLayer .farm-sun{position:absolute;top:7vh;left:0;width:58px;height:58px;border-radius:50%;
+  background:radial-gradient(circle at 35% 32%,#fff8bf 0 12%,#ffd85a 42%,#f3a52b 100%);
+  box-shadow:0 0 0 9px rgba(255,198,54,.14),0 0 34px rgba(255,176,35,.45);
+  animation:sunWander 42s ease-in-out infinite alternate}
+#fxLayer .farm-sun::before{content:'';position:absolute;inset:-16px;border-radius:50%;
+  background:repeating-conic-gradient(from 0deg,rgba(255,193,47,.5) 0 7deg,transparent 7deg 22deg);z-index:-1}
+@keyframes sunWander{from{transform:translateX(10vw) translateY(0)}to{transform:translateX(78vw) translateY(5vh)}}
+#fxLayer .farm-hills{position:absolute;left:-8%;right:-8%;bottom:22%;height:30%;
+  background:linear-gradient(145deg,transparent 0 34%,rgba(132,91,44,.3) 35% 58%,transparent 59%),
+    linear-gradient(18deg,#a96b39 0 40%,#c58a4a 41% 68%,transparent 69%);border-radius:50% 50% 0 0/35% 35% 0 0;opacity:.18}
+#fxLayer .farm-field{position:absolute;inset:auto -5% -5% -5%;height:32%;
+  background:repeating-linear-gradient(172deg,rgba(102,56,29,.36) 0 3px,transparent 3px 27px),
+    linear-gradient(180deg,#bd7b3c,#8e522f);transform:perspective(360px) rotateX(8deg);opacity:.2}
+#fxLayer .farm-crop{position:absolute;bottom:18%;font-size:clamp(20px,2.5vw,34px);filter:drop-shadow(0 3px 3px rgba(73,39,18,.28));animation:cropSway 5.5s ease-in-out infinite alternate}
+#fxLayer .farm-crop:nth-of-type(2){animation-delay:-1.7s}#fxLayer .farm-crop:nth-of-type(3){animation-delay:-3.1s}
+@keyframes cropSway{from{transform:rotate(-2deg) translateY(1px)}to{transform:rotate(2deg) translateY(-3px)}}
+#fxLayer .farm-animal{position:absolute;bottom:9%;font-size:clamp(24px,3vw,40px);filter:drop-shadow(0 4px 4px rgba(54,29,16,.3));opacity:.58;animation:animalWander 36s ease-in-out infinite alternate}
+#fxLayer .farm-animal.pig{right:12%;animation-delay:-13s}#fxLayer .farm-animal.chicken{left:18%;font-size:clamp(18px,2vw,28px);animation-delay:-6s}
+@keyframes animalWander{from{translate:-3vw 0}to{translate:7vw -3px}}
 /* ============ 主题5: 深海·夜海(body.ocean) ============ */
 body.ocean{
   color-scheme:dark;
@@ -1711,6 +2417,27 @@ body.ocean{
   --glass:rgba(8,32,44,.74);
 }
 body.ocean::before,body.ocean::after{opacity:.08}
+/* ============ 主题: 太阳系 · 八大行星(body.solar) ============ */
+body.solar{
+  color-scheme:dark;
+  --bg:radial-gradient(900px 680px at 72% 46%,rgba(21,35,70,.32),transparent 65%),
+       linear-gradient(160deg,#03050b 0%,#070b16 48%,#020309 100%);
+  --card:#111725; --card-sel:#17243a; --border:#26344b; --border-hi:#63a7ff;
+  --text:#e8eef9; --muted:#a9b8cf; --faint:#71829c;
+  --input:#0c1220; --accent:#63a7ff; --accent2:#f0a84b;
+  --grad:linear-gradient(120deg,#63a7ff,#8b7cf6 56%,#f0a84b);
+  --btn-grad:linear-gradient(120deg,#3f83d8 0%,#6d62d5 58%,#d78b35 100%);
+  --shadow-sm:0 1px 2px rgba(0,0,0,.58),0 2px 12px rgba(24,58,110,.18);
+  --shadow-md:0 12px 36px rgba(0,0,0,.64),0 0 22px rgba(99,167,255,.18);
+  --chip-bg:#17243a; --chip-bd:#2c4569; --chip-tx:#91c2ff;
+  --box-bg:#191b23; --box-bd:#4c4c57; --box-tx:#d8d3c6;
+  --mem-bg:#211b17; --mem-bd:#58402c; --mem-tx:#efbd7a;
+  --on:#54dc91; --off:#657087;
+  --glass:rgba(12,18,30,.82);
+}
+body.solar::before,body.solar::after{opacity:.04}
+body.solar .card:hover{box-shadow:var(--shadow-md),0 0 24px rgba(99,167,255,.2)}
+body.solar textarea:focus,body.solar input:focus,body.solar select:focus{box-shadow:0 0 0 4px rgba(99,167,255,.18)}
 /* ============ 装饰层(流星雨/绵羊/深海,按主题由 JS 注入) ============ */
 #fxLayer{position:fixed;inset:0;z-index:-1;pointer-events:none;overflow:hidden}
 /* —— 极客: 网格 + 星星 + 流星 —— */
@@ -1804,6 +2531,37 @@ body.ocean::before,body.ocean::after{opacity:.08}
   7%{opacity:1}18%{transform:translate(-4vw,32vh) scale(1) rotate(180deg)}
   24%{transform:translate(-9vw,34vh) rotate(160deg)}62%{transform:translate(-30vw,28vh) rotate(200deg)}
   100%{transform:translate(-74vw,22vh) rotate(180deg);opacity:0}}
+/* —— 太阳系: 太阳 + 八条椭圆轨道 + 八大行星 —— */
+#fxLayer .solar-space{position:absolute;inset:0;background:
+  radial-gradient(1px 1px at 7% 14%,#fff,transparent),radial-gradient(1px 1px at 18% 74%,#a8c9ff,transparent),
+  radial-gradient(1.5px 1.5px at 29% 32%,#fff,transparent),radial-gradient(1px 1px at 43% 81%,#e4edff,transparent),
+  radial-gradient(1px 1px at 58% 9%,#fff,transparent),radial-gradient(1.5px 1.5px at 67% 67%,#b7d3ff,transparent),
+  radial-gradient(1px 1px at 78% 24%,#fff,transparent),radial-gradient(1px 1px at 91% 72%,#d8e6ff,transparent),
+  radial-gradient(1.5px 1.5px at 96% 11%,#fff,transparent);background-size:310px 250px;opacity:.64}
+#fxLayer .solar-system{position:absolute;left:72%;top:50%;width:min(88vmin,760px);aspect-ratio:1;
+  transform:translate(-50%,-50%) rotateX(61deg);transform-style:preserve-3d;opacity:.82}
+#fxLayer .solar-sun{position:absolute;left:50%;top:50%;width:clamp(38px,7vmin,66px);aspect-ratio:1;border-radius:50%;
+  transform:translate(-50%,-50%) rotateX(-61deg);z-index:20;
+  background:radial-gradient(circle at 34% 30%,#fffbd0 0 8%,#ffd45d 26%,#f69a26 62%,#d64a10 100%);
+  box-shadow:0 0 18px 7px rgba(255,184,62,.72),0 0 54px 20px rgba(255,112,24,.33),0 0 110px 38px rgba(255,74,15,.1);
+  animation:solarPulse 5s ease-in-out infinite alternate}
+@keyframes solarPulse{from{filter:brightness(.95)}to{filter:brightness(1.16)}}
+#fxLayer .orbit{--size:30%;--dur:12s;position:absolute;left:50%;top:50%;width:var(--size);aspect-ratio:1;
+  border:1px solid rgba(154,183,224,.2);border-radius:50%;transform-style:preserve-3d;
+  animation:solarOrbit var(--dur) linear infinite}
+@keyframes solarOrbit{from{transform:translate(-50%,-50%) rotateZ(0)}to{transform:translate(-50%,-50%) rotateZ(360deg)}}
+#fxLayer .planet{--planet:8px;position:absolute;left:50%;top:0;width:var(--planet);height:var(--planet);
+  border-radius:50%;transform:translate(-50%,-50%) rotateX(-61deg);box-shadow:inset -2px -2px 3px rgba(0,0,0,.48),0 0 5px rgba(255,255,255,.2)}
+#fxLayer .mercury{--size:19%;--dur:9s}.mercury .planet{--planet:5px;background:#a7a39c}
+#fxLayer .venus{--size:27%;--dur:14s}.venus .planet{--planet:8px;background:linear-gradient(135deg,#f4d08b,#b96e35)}
+#fxLayer .earth{--size:36%;--dur:20s}.earth .planet{--planet:9px;background:radial-gradient(circle at 38% 35%,#79bf65 0 18%,#2e85cf 23% 70%,#173c7b)}
+#fxLayer .mars{--size:45%;--dur:27s}.mars .planet{--planet:7px;background:linear-gradient(135deg,#e38258,#913820)}
+#fxLayer .jupiter{--size:57%;--dur:39s}.jupiter .planet{--planet:18px;background:repeating-linear-gradient(180deg,#e2bf91 0 3px,#a96c4b 3px 5px,#f0d4ac 5px 8px)}
+#fxLayer .saturn{--size:69%;--dur:52s}.saturn .planet{--planet:15px;background:linear-gradient(180deg,#ead19c,#a88754)}
+#fxLayer .saturn .planet::after{content:'';position:absolute;left:50%;top:50%;width:25px;height:8px;border:2px solid rgba(231,208,159,.82);border-radius:50%;transform:translate(-50%,-50%) rotate(-18deg)}
+#fxLayer .uranus{--size:81%;--dur:68s}.uranus .planet{--planet:11px;background:linear-gradient(135deg,#b8f0ed,#4aa5b4)}
+#fxLayer .neptune{--size:94%;--dur:86s}.neptune .planet{--planet:11px;background:linear-gradient(135deg,#5b9bff,#203a9d)}
+@media(max-width:720px){#fxLayer .solar-system{left:70%;top:35%;width:94vmin;opacity:.66}}
 /* ============ 自绘提示框(替代原生 alert/confirm/prompt) ============ */
 .dlgmask{position:fixed;inset:0;z-index:1000;background:rgba(8,12,20,.42);
   backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
@@ -1826,6 +2584,88 @@ body.ocean::before,body.ocean::after{opacity:.08}
   color:var(--text);transition:.15s;white-space:nowrap}
 #themePanel .thopt:hover{background:var(--card-sel);transform:translateX(-2px)}
 #themePanel .thopt.cur{background:var(--grad);color:#fff;font-weight:600}
+#themePanel .thgroup{margin:8px 7px 4px;color:var(--faint);font-size:10px;font-weight:700;letter-spacing:1.2px}
+#themePanel .thgroup:first-child{margin-top:3px}
+/* ---- 视频测试表单: 紧凑、可扫描、移动端不挤成一团 ---- */
+.test-hub-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.test-entry{min-height:112px;display:flex;flex-direction:column;justify-content:center;gap:5px}
+.vt-page h2{margin-top:10px}
+.vt-page .box{border-radius:8px;padding:14px 16px;margin:11px 0}
+.vt-page .card{border-radius:8px;padding:14px 16px}
+.vt-panel-title{font-size:13px;font-weight:700;color:var(--text);margin-bottom:8px}
+.vt-help{margin:8px 0 14px}
+.vt-form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:end;margin:12px 0}
+.vt-form-grid>span{min-width:0}
+.vt-choice-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(145px,1fr));gap:7px}
+.vt-choice-grid-short{grid-template-columns:repeat(auto-fill,minmax(92px,1fr))}
+#app:has([id^="vt"]) .vt-choice-grid>label.vt-choice{display:flex;margin:0;min-height:42px}
+#app:has([id^="vt"]) .vt-choice small{display:block;color:var(--faint);font-size:11px;margin-top:2px}
+.vt-toggle{display:flex!important;align-items:center;gap:7px;margin:0!important;padding:10px;border:1px solid var(--border);border-radius:7px;background:var(--input);color:var(--text)!important}
+#app:has([id^="vt"]) input[type=text],#app:has([id^="vt"]) input[type=number],#app:has([id^="vt"]) select,
+.vt-page input[type=text],.vt-page input[type=number],.vt-page select{min-height:40px;border-radius:7px;padding:9px 11px}
+#app:has([id^="vt"]) textarea,.vt-page textarea{min-height:120px;border-radius:7px;padding:11px 12px}
+#app:has([id^="vt"]) .box>div>label{display:inline-flex;align-items:center;gap:7px;margin:4px 6px 4px 0;padding:8px 10px;border:1px solid var(--border);border-radius:7px;background:var(--input);color:var(--text);font-weight:500;cursor:pointer;transition:.15s}
+#app:has([id^="vt"]) .box>div>label:has(input:checked){border-color:var(--border-hi);background:var(--card-sel);color:var(--accent);box-shadow:0 0 0 2px rgba(95,135,255,.12)}
+#app:has([id^="vt"]) input[type=checkbox]{flex:0 0 auto}
+#app:has([id^="vt"]) .row>span{flex:1 1 180px;min-width:150px}
+#app:has([id^="vt"]) .row>span>input,#app:has([id^="vt"]) .row>span>select{width:100%;margin-top:4px}
+.vt-page .row,#app:has([id^="vt"]) .row{gap:14px 16px}
+.vt-page .row button{min-height:40px;padding:9px 14px}
+#app:has([id^="vt"]) p{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-top:18px}
+#app:has([id^="vt"]) p>button{margin:0}
+.vt-page .test-entry:hover{transform:translateY(-2px)}
+.vt-name-list{display:grid;gap:9px;margin:10px 0 16px}
+.vt-name-row{display:grid;grid-template-columns:minmax(180px,.8fr) minmax(260px,1.2fr);gap:14px;align-items:center;
+  padding:11px 13px;background:var(--input);border:1px solid var(--border);border-radius:9px}
+.vt-name-model{display:flex;align-items:center;gap:10px;min-width:0}
+.vt-name-index{display:inline-flex;align-items:center;justify-content:center;flex:0 0 30px;height:30px;border-radius:7px;
+  background:var(--chip-bg);border:1px solid var(--chip-bd);color:var(--accent);font:700 12px ui-monospace,monospace}
+.vt-name-model strong{display:block;color:var(--text);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.vt-name-model small{display:block;margin-top:2px;color:var(--faint);font-size:11px}
+.vt-name-control label{margin:0 0 4px;font-size:11px;color:var(--faint);font-weight:600}
+.vt-name-control{min-width:0}
+.vt-name-control-line{display:flex;align-items:center;gap:8px}
+.vt-name-control-line .vt-pretty-input{flex:1;min-width:0}
+.vt-rename-btn{flex:0 0 auto;min-height:38px!important;padding:8px 11px!important;border-radius:7px!important;font-size:12px!important}
+.vt-pretty-input{display:flex;align-items:stretch;overflow:hidden;min-height:43px;background:var(--input);
+  border:1px solid var(--border);border-radius:8px;box-shadow:inset 0 1px 2px rgba(0,0,0,.08);
+  transition:border-color .16s,box-shadow .16s,background .16s}
+.vt-pretty-input:focus-within{border-color:var(--border-hi);background:var(--card-sel);
+  box-shadow:0 0 0 3px rgba(95,135,255,.15),inset 0 1px 2px rgba(0,0,0,.05)}
+.vt-field-icon{display:flex;align-items:center;justify-content:center;flex:0 0 40px;border-right:1px solid var(--border);
+  background:var(--chip-bg);color:var(--accent);font-size:15px;line-height:1;user-select:none}
+.vt-pretty-input input{min-width:0!important;min-height:41px!important;border:0!important;border-radius:0!important;
+  background:transparent!important;box-shadow:none!important;padding:9px 11px!important;color:var(--text)}
+.vt-input-shell{position:relative}
+.vt-input-shell input{padding-right:30px!important}
+.vt-folder-tail{position:absolute;right:11px;top:50%;transform:translateY(-50%);color:var(--faint);font-size:12px;pointer-events:none}
+.vt-name-options{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:4px 0 8px}
+.vt-name-option{padding:12px;background:var(--card);border:1px solid var(--border);border-radius:9px}
+.vt-name-option label{margin:0 0 5px;color:var(--muted);font-size:12px}
+.vt-name-option .small{margin-top:5px}
+.vt-setting-note{margin:-4px 0 4px;padding:9px 11px;border-left:3px solid var(--accent);background:var(--input);border-radius:6px}
+.vt-name-option-actions{display:flex;gap:7px;margin-top:7px}
+.vt-name-option-actions button{min-height:32px;padding:5px 11px;font-size:12px;border-radius:7px}
+.vt-nav-actions{display:flex;gap:16px;align-items:center;margin-top:18px}
+.vt-nav-actions button{min-width:112px}
+@media(max-width:620px){
+  .test-hub-grid{grid-template-columns:1fr}
+  .vt-form-grid{grid-template-columns:1fr}
+  .vt-name-row,.vt-name-options{grid-template-columns:1fr}
+  .vt-name-control-line{align-items:stretch}.vt-name-control-line .vt-pretty-input{min-width:0}
+  .vt-rename-btn{min-width:72px!important}
+  #app:has([id^="vt"]) .row>span{flex-basis:100%;min-width:0}
+  .vt-page .row button{flex:1 1 auto}
+  #app:has([id^="vt"]) p{gap:9px}
+}
+@media(max-width:820px){.vid-workspace{grid-template-columns:1fr}.vid-side{position:static;border-left:0;border-top:1px solid var(--border);padding:16px 0 0}}
+/* 主题过渡：从右上角主题按钮所在的屏幕右上角向左展开，禁用浏览器默认淡入 */
+::view-transition-old(root){animation:none}
+::view-transition-new(root){animation:themeReveal .56s cubic-bezier(.4,0,.2,1) both}
+@keyframes themeReveal{
+  from{clip-path:circle(0 at 100% 0)}
+  to{clip-path:circle(150% at 100% 0)}
+}
 /* ============ 翻书翻页 + 模型卡片掉落 + 点击反馈 ============ */
 #app.flipin{animation:pageIn .45s cubic-bezier(.25,.8,.3,1) both;transform-origin:left center}
 @keyframes pageIn{from{opacity:0;transform:perspective(1400px) rotateY(-7deg) translateX(30px)}
@@ -1839,8 +2679,11 @@ body.ocean::before,body.ocean::after{opacity:.08}
   body::before,body::after,h1,.bar>i::after,.spin{animation:none!important}
   #app .card,#app .box,#app .logbox,#app .tabs{animation:none!important}
   #app.flipin,#app .card.drop-in{animation:none!important}
+  ::view-transition-old(root),::view-transition-new(root){animation:none!important}
+  #fxLayer .github-hole-canvas{display:none!important}
   #fxLayer .meteor,#fxLayer .cloud,#fxLayer .sheepy,#fxLayer .sheeppos,#fxLayer .stars{animation:none!important}
   #fxLayer .fish,#fxLayer .bub{animation:none!important;display:none}
+  #fxLayer .orbit,#fxLayer .solar-sun{animation:none!important}
   #fxLayer .meteor{display:none}
 }
 </style></head><body>
@@ -1902,22 +2745,90 @@ function cPrompt(msg, def){
   });
 }
 // ============ 主题: 白天/黑夜/极客流星雨/绵羊暖白 ============
-const THEMES=[['light','☀️ 白天 · 清透'],['dark','🌙 黑夜 · 护眼'],['tech','🌠 极客 · 流星雨'],['sheep','🐑 绵羊 · 暖白'],['ocean','🌊 深海 · 夜海']];
-const THEME_ICON={light:'🌙',dark:'☀️',tech:'🌠',sheep:'🐑',ocean:'🌊'};
+const THEMES=[
+  ['light','☀️ 白天 · 清透','日间'],['sunny','🌻 农家乐 · 向日葵','日间'],['sheep','🐑 绵羊 · 暖白','日间'],
+  ['dark','🌙 黑夜 · 护眼','夜间'],['ocean','🌊 深海 · 夜海','夜间'],['solar','🪐 太阳系 · 八大行星','夜间'],
+  ['tech','🌠 极客 · 流星雨','科技'],['github','🐙 GitHub · 夜间科技','科技']
+];
+const THEME_ICON={light:'🌙',dark:'☀️',tech:'🌠',sheep:'🐑',sunny:'🌻',ocean:'🌊',solar:'🪐',github:'🐙'};
+const THEME_CLASSES=THEMES.map(t=>t[0]).filter(k=>k!=='light');
 const __mq = (window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null);
+const __reduceMotion=window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)');
+const githubBlackHoleFx={
+  raf:0,canvas:null,ctx:null,particles:[],mouse:{x:0,y:0,until:0},hole:null,last:0,resize:null,move:null,
+  stop(){
+    if(this.raf) cancelAnimationFrame(this.raf);
+    if(this.resize) window.removeEventListener('resize',this.resize);
+    if(this.move) window.removeEventListener('pointermove',this.move);
+    if(this.canvas) this.canvas.remove();
+    this.raf=0;this.canvas=this.ctx=this.resize=this.move=null;this.particles=[];this.hole=null;
+  },
+  start(fx){
+    this.stop();
+    if(__reduceMotion&&__reduceMotion.matches) return;
+    const canvas=document.createElement('canvas'); canvas.className='github-hole-canvas'; fx.appendChild(canvas);
+    const ctx=canvas.getContext('2d'); if(!ctx) return;
+    this.canvas=canvas;this.ctx=ctx;
+    const reset=(p,far)=>{
+      const a=Math.random()*Math.PI*2,d=far?Math.max(innerWidth,innerHeight)*(.38+Math.random()*.38):Math.random()*Math.max(innerWidth,innerHeight);
+      p.x=innerWidth/2+Math.cos(a)*d;p.y=innerHeight/2+Math.sin(a)*d;
+      p.vx=(Math.random()-.5)*.28;p.vy=(Math.random()-.5)*.28;p.size=1+Math.random()*1.8;p.alpha=.35+Math.random()*.65;
+    };
+    const fit=()=>{
+      const ratio=Math.min(devicePixelRatio||1,1.5); canvas.width=Math.round(innerWidth*ratio);canvas.height=Math.round(innerHeight*ratio);
+      ctx.setTransform(ratio,0,0,ratio,0,0);
+    };
+    fit(); this.resize=fit; window.addEventListener('resize',fit);
+    const h={x:innerWidth*.68,y:innerHeight*.38,tx:innerWidth*.68,ty:innerHeight*.38,next:performance.now()+6000}; this.hole=h;
+    const count=innerWidth<700?48:72;
+    for(let i=0;i<count;i++){const p={};reset(p,false);this.particles.push(p);}
+    this.move=e=>{this.mouse.x=e.clientX;this.mouse.y=e.clientY;this.mouse.until=performance.now()+800;};
+    window.addEventListener('pointermove',this.move,{passive:true});
+    const draw=now=>{
+      if(!this.canvas||document.hidden){this.raf=requestAnimationFrame(draw);return;}
+      if(now-this.last<32){this.raf=requestAnimationFrame(draw);return;} this.last=now;
+      if(now>h.next){h.tx=innerWidth*(.18+Math.random()*.64);h.ty=innerHeight*(.18+Math.random()*.58);h.next=now+8000+Math.random()*6000;}
+      h.x+=(h.tx-h.x)*.006;h.y+=(h.ty-h.y)*.006;
+      ctx.clearRect(0,0,innerWidth,innerHeight);
+      for(const p of this.particles){
+        const dx=h.x-p.x,dy=h.y-p.y,d2=dx*dx+dy*dy+1800,force=Math.min(.95,4200/d2);
+        p.vx+=dx*force*.018-dy*force*.008;p.vy+=dy*force*.018+dx*force*.008;
+        if(now<this.mouse.until){const mx=this.mouse.x-p.x,my=this.mouse.y-p.y,md=Math.hypot(mx,my);if(md<165){const mf=(1-md/165)*.032;p.vx+=mx*mf;p.vy+=my*mf;}}
+        p.vx*=.986;p.vy*=.986;p.x+=p.vx;p.y+=p.vy;
+        if(Math.hypot(dx,dy)<24||p.x<-20||p.x>innerWidth+20||p.y<-20||p.y>innerHeight+20) reset(p,true);
+        ctx.fillStyle=`rgba(255,${150+Math.round(p.alpha*75)},${40+Math.round(p.alpha*100)},${p.alpha})`;
+        ctx.fillRect(p.x,p.y,p.size,p.size);
+      }
+      const disk=ctx.createRadialGradient(h.x,h.y,12,h.x,h.y,68);disk.addColorStop(0,'rgba(0,0,0,1)');disk.addColorStop(.3,'rgba(0,0,0,.96)');disk.addColorStop(.55,'rgba(255,107,0,.34)');disk.addColorStop(.72,'rgba(255,209,102,.14)');disk.addColorStop(1,'rgba(255,175,40,0)');
+      ctx.fillStyle=disk;ctx.beginPath();ctx.arc(h.x,h.y,68,0,Math.PI*2);ctx.fill();
+      ctx.fillStyle='#020202';ctx.beginPath();ctx.arc(h.x,h.y,22,0,Math.PI*2);ctx.fill();
+      this.raf=requestAnimationFrame(draw);
+    };
+    this.raf=requestAnimationFrame(draw);
+  }
+};
 function buildFx(name){ // 按主题注入装饰层(极客=网格+星星+流星;绵羊=云+小羊)
+  githubBlackHoleFx.stop();
   let fx=document.getElementById('fxLayer');
   if(!fx){ fx=document.createElement('div'); fx.id='fxLayer'; document.body.appendChild(fx); }
   if(name==='tech'){
     fx.innerHTML='<div class="grid"></div><div class="stars"></div>'+
       [[6,4,'0s','7s'],[22,16,'2.6s','9s'],[38,6,'5.4s','8s'],[55,24,'1.2s','10.5s'],
-       [70,10,'6.8s','6.5s'],[86,30,'3.8s','11s']].map(m=>
+       [70,10,'6.8s','6.5s'],[86,30,'3.8s','11s'],[14,42,'-4.2s','8.5s'],[31,58,'-7.1s','9.8s'],
+       [49,38,'-2.4s','7.4s'],[67,54,'-5.6s','10.8s'],[91,64,'-8.3s','8.9s']].map(m=>
       `<div class="meteor" style="left:${m[0]}%;top:${m[1]}%;animation-delay:${m[2]};animation-duration:${m[3]}"></div>`).join('');
+  }else if(name==='github'){
+    fx.innerHTML='<div class="grid"></div><div class="stars"></div>';
+    githubBlackHoleFx.start(fx);
   }else if(name==='sheep'){
     const sheep=`<div class="wool"></div><div class="shead"><i class="sear"></i><i class="seye"></i></div><i class="sleg sl1"></i><i class="sleg sl2"></i>`;
-    fx.innerHTML='<div class="cloud c1"></div><div class="cloud c2"></div><div class="cloud c3"></div>'+
+    fx.innerHTML='<div class="cloud c1"></div><div class="cloud c2"></div><div class="cloud c3"></div>';
       [['5%','1','0s','34s'],['70%','.74','1.4s','47s'],['36%','.56','2.6s','40s']].map(s=>
       `<div class="sheeppos" style="left:${s[0]};scale:${s[1]};animation:sheepWander ${s[3]} ease-in-out infinite alternate;animation-delay:-${parseFloat(s[3])/2}s"><div class="sheepy" style="animation-delay:${s[2]}">${sheep}</div></div>`).join('');
+  }else if(name==='sunny'){
+    fx.innerHTML='<div class="farm-sun"></div><div class="farm-hills"></div><div class="farm-field"></div>'+
+      '<span class="farm-crop" style="left:10%">🌻</span><span class="farm-crop" style="left:47%">🥕</span><span class="farm-crop" style="left:76%">🌻</span>'+
+      '<span class="farm-animal chicken">🐔</span><span class="farm-animal pig">🐖</span>';
   }else if(name==='ocean'){
     fx.innerHTML='<div class="sea"></div><div class="stars"></div>'+
       [[8,'9px','13s','0s'],[20,'6px','17s','-6s'],[46,'8px','15s','-3s'],[70,'5px','19s','-9s'],[88,'7px','14s','-4s']].map(b=>
@@ -1929,11 +2840,15 @@ function buildFx(name){ // 按主题注入装饰层(极客=网格+星星+流星;
       `<span class="fish shark" style="top:38.5%;font-size:42px">🦈</span>`+
       `<span class="fish whale">🐋</span>`+
       `<span class="fish polar" style="left:62%">⭐</span>`;
+  }else if(name==='solar'){
+    const planets=['mercury','venus','earth','mars','jupiter','saturn','uranus','neptune'];
+    fx.innerHTML='<div class="solar-space"></div><div class="solar-system"><div class="solar-sun"></div>'+
+      planets.map((p,i)=>`<div class="orbit ${p}" style="animation-delay:-${i*4.7}s"><i class="planet"></i></div>`).join('')+'</div>';
   }else fx.innerHTML='';
 }
 function applyTheme(name){
   if(!THEMES.some(t=>t[0]===name)) name='light';
-  document.body.classList.remove('dark','tech','sheep','ocean');
+  document.body.classList.remove(...THEME_CLASSES);
   if(name!=='light') document.body.classList.add(name);
   const b=$('#themeBtn'); if(b){ b.textContent=THEME_ICON[name]; b.title='切换主题(当前: '+THEMES.find(t=>t[0]===name)[1]+')'; }
   buildFx(name);
@@ -1944,32 +2859,27 @@ function savedTheme(){ try{ return localStorage.getItem('ivs_theme'); }catch(e){
 function setTheme(name){
   try{localStorage.setItem('ivs_theme',name);}catch(e){}
   const p=document.getElementById('themePanel'); if(p) p.remove();   // 点选项后收起面板
-  // 圆形扩散"推"过去: 新主题色的圆先从右上角扩散(圆内新主题、圆外还是旧主题),圆满屏那一刻才真正换肤
-  const CLS=['dark','tech','sheep','ocean'];
-  const curCls=CLS.filter(c=>document.body.classList.contains(c));
-  document.body.classList.remove(...CLS); if(name!=='light') document.body.classList.add(name);
-  const bg=getComputedStyle(document.body).getPropertyValue('--bg')||'#888';   // 探测新主题背景
-  document.body.classList.remove(...CLS); curCls.forEach(c=>document.body.classList.add(c));  // 立刻换回旧主题(同帧不渲染)
   const b=$('#themeBtn'); const r=b?b.getBoundingClientRect():{left:innerWidth-59,top:16,width:42,height:42};
   const cx=r.left+r.width/2, cy=r.top+r.height/2;
-  const rad=Math.hypot(Math.max(cx,innerWidth-cx),Math.max(cy,innerHeight-cy));
-  const fx=document.createElement('div');
-  fx.style.cssText=`position:fixed;left:${cx}px;top:${cy}px;width:0;height:0;border-radius:50%;z-index:998;pointer-events:none;background:${bg};`;
-  document.body.appendChild(fx);
-  requestAnimationFrame(()=>{
-    fx.style.transition='all .6s cubic-bezier(.4,0,.2,1)';
-    fx.style.left=(cx-rad)+'px'; fx.style.top=(cy-rad)+'px';
-    fx.style.width=fx.style.height=(rad*2)+'px';
-  });
-  setTimeout(()=>{ applyTheme(name);                  // 圆已满屏: 此刻换肤,圆下页面与圆同为新主题,无缝衔接
-    fx.style.transition='opacity .3s'; fx.style.opacity='0'; setTimeout(()=>fx.remove(),320); },610);
+  const rx=Math.max(cx,innerWidth-cx), ry=Math.max(cy,innerHeight-cy);
+  // 明确把揭幕中心锁定在右上角主题按钮，避免浏览器默认从中心淡入
+  document.documentElement.style.setProperty('--theme-cx',`${cx}px`);
+  document.documentElement.style.setProperty('--theme-cy',`${cy}px`);
+  document.documentElement.style.setProperty('--theme-rx',`${rx}px`);
+  document.documentElement.style.setProperty('--theme-ry',`${ry}px`);
+  if(document.startViewTransition){
+    document.startViewTransition(()=>applyTheme(name));
+    return;
+  }
+  applyTheme(name);
 }
 function toggleTheme(){ // 点开/收起主题选择面板
   let p=document.getElementById('themePanel');
   if(p){ p.remove(); return; }
-  const cur=[...document.body.classList].find(c=>['dark','tech','sheep','ocean'].includes(c))||'light';
+  const cur=[...document.body.classList].find(c=>THEME_CLASSES.includes(c))||'light';
   p=document.createElement('div'); p.id='themePanel';
-  p.innerHTML=THEMES.map(t=>`<div class="thopt ${t[0]===cur?'cur':''}" data-t="${t[0]}" onclick="setTheme('${t[0]}')">${t[1]}</div>`).join('');
+  p.innerHTML=['日间','夜间','科技'].map(g=>`<div class="thgroup">${g}</div>`+
+    THEMES.filter(t=>t[2]===g).map(t=>`<div class="thopt ${t[0]===cur?'cur':''}" data-t="${t[0]}" onclick="setTheme('${t[0]}')">${t[1]}</div>`).join('')).join('');
   document.body.appendChild(p);
   setTimeout(()=>document.addEventListener('mousedown',function h(e){ if(!p.contains(e.target)){ p.remove(); document.removeEventListener('mousedown',h); } }),0);
 }
@@ -1977,6 +2887,10 @@ function toggleTheme(){ // 点开/收起主题选择面板
   const t=savedTheme();                                  // null=没手动选过
   applyTheme(t || (__mq && __mq.matches ? 'dark' : 'light'));
   if(__mq && __mq.addEventListener) __mq.addEventListener('change', e=>{ if(!savedTheme()) applyTheme(e.matches?'dark':'light'); });
+  if(__reduceMotion&&__reduceMotion.addEventListener) __reduceMotion.addEventListener('change', e=>{
+    if(e.matches) githubBlackHoleFx.stop();
+    else if(document.body.classList.contains('github')) buildFx('github');
+  });
 })();
 
 async function home(){
@@ -2005,7 +2919,7 @@ async function home(){
   }
   const vidCard = st.vid.running
     ? `<div class="card" onclick="goStep(10)"><b>🎬 视频生成</b> <span class="dot on">● 服务运行中</span><div class="small">点击进入图生视频</div></div>`
-    : `<div class="card" onclick="startAndGo('vid',10)"><b>🎬 视频生成</b> <span class="dot off">○ 未启动</span><div class="small">点击启动并进入(会先停掉其他服务腾内存)</div></div>`;
+    : `<div class="card" onclick="enterVideo()"><b>🎬 视频生成</b> <span class="dot off">○ 未启动</span><div class="small">点击检查后台任务并进入；空闲时会启动视频服务</div></div>`;
   let llmCard;
   if(st.llm.running) llmCard = `<div class="card" onclick="goStep(22)"><b>💬 语言模型</b> <span class="dot on">● 运行中</span><div class="small">点击进入</div></div>`;
   else if(st.llm.alive_pid) llmCard = `<div class="card" onclick="goStep(22)"><b>💬 语言模型</b> <span class="dot off">◐ 加载中…</span><div class="small">点击进入查看</div></div>`;
@@ -2020,6 +2934,33 @@ async function home(){
   $('#app').innerHTML = `<h2>选一个开始</h2>` + imgCard + vidCard + llmCard + ttsCard;
 }
 function goStep(n){ ST.step=n; render(); }
+function enterVideo(){ ST._videoTaskOnly=false; startAndGo('vid',10); }
+function vidTaskStateLabel(s){ return ({running:'运行中',queued:'排队中',done:'已完成',failed:'失败'})[s]||s||'未知'; }
+function vidTaskCard(t){
+  const state=t.state||'done', active=state==='running'||state==='queued';
+  const title=esc(t.name||'未命名视频'), engine=t.engine==='video'?'普通视频模型':'视频';
+  const id=encodeURIComponent(t.id||''), url=encodeURIComponent(t.url||''), name=encodeURIComponent(t.name||'视频');
+  const action=active
+    ? `<button onclick="vidOpenTask('${id}','${t.engine}', '${url}', '${state}', '${name}')">查看进度</button>`
+    : (t.url?`<button onclick="vidOpenTask('${id}','${t.engine}', '${url}', '${state}', '${name}')">查看成片</button>`:'');
+  return `<div class="vid-task"><div class="vid-task-title">${title}</div><div class="vid-task-meta"><span class="vid-state ${state}">${vidTaskStateLabel(state)}</span> · ${engine}${t.error?`<br><span style="color:#d03050">${esc(t.error)}</span>`:''}</div><div class="vid-task-actions">${action}</div></div>`;
+}
+async function vidTasksPanel(){
+  const el=$('#vidTasksPanel'); if(!el)return;
+  let d; try{ d=await j('/api/vid/tasks'); }catch(e){ el.innerHTML='<div class="vid-empty">任务状态暂时读不到，点刷新重试。</div>'; return; }
+  const groups=[['running','正在运行'],['queued','排队中'],['done','已完成'],['failed','失败']];
+  let html='';
+  for(const [state,label] of groups){ const rows=(d.tasks||[]).filter(t=>t.state===state); if(rows.length) html+=`<div class="vid-task-group">${label} · ${rows.length}</div>`+rows.map(vidTaskCard).join(''); }
+  el.innerHTML=html||'<div class="vid-empty">还没有视频任务。<br>生成过的视频会自动出现在这里。</div>';
+  if(window.__vidTaskTimer) clearTimeout(window.__vidTaskTimer);
+  if(ST.step===10) window.__vidTaskTimer=setTimeout(vidTasksPanel,5000);
+}
+function vidOpenTask(id,engine,url,state,name){
+  id=decodeURIComponent(id); url=decodeURIComponent(url); name=decodeURIComponent(name);
+  ST.vid=ST.vid||{}; ST.vid.pid=id; ST.vid.url=url||null; ST.vid.taskName=name;
+  if(state==='done' && url){ ST.step=12; render(); }
+  else { ST.step=11; render(); }
+}
 async function startAndGo(type, nextStep){
   $('#app').innerHTML = `<div class="box">🚀 正在启动${type==='img'?'生图':'生视频'}服务…<br><span class="small">会先自动停掉其他服务腾内存,首次加载模型约 1~2 分钟。</span><div class="bar" style="margin-top:12px"><i class="indet"></i></div><div class="small" style="margin-top:8px">已等待 <b id="waitSec">0</b> 秒</div></div>`;
   const r = await j('/api/svc/start?type='+type);
@@ -2068,6 +3009,57 @@ async function render(){
       drawSzBox(i);
     }
   }
+  if(ST.step===90){ // 高质量图片: 先生成脸部参考,再锁脸做服装/身材版本
+    const ms=await j('/api/models');
+    const cps=ms.filter(m=>m.kind==='checkpoint'||m.hq_lock);
+    const h=ST.hq||(ST.hq={});
+    if(!h.model && cps.length){
+      const pref=cps.find(m=>/lustify/i.test(m.id+' '+m.name))||cps.find(m=>/waiNSFW/i.test(m.id+' '+m.name))||cps.find(m=>/realvis|cyber/i.test(m.id+' '+m.name))||cps[0];
+      h.model=pref.id;
+    }
+    if(!h.facePrompt) h.facePrompt='adult East Asian woman, elegant soft oval face, delicate refined facial features, almond-shaped eyes, defined nose, naturally full lips, long loose black hair flowing over the shoulders, calm confident expression, wearing an elegant high-collar red silk qipao, ethereal Chinese fairy-like beauty, luxury editorial fashion portrait, neutral porcelain skin tone, cool soft studio lighting, balanced white balance, clean light-gray background, photorealistic, highly detailed';
+    if(!h.neg) h.neg=NEG_DEF+', blurry face, asymmetrical eyes, deformed hands, bad anatomy, yellow skin, orange skin, warm color cast, oversaturated skin, hair bun, updo, plastic doll face';
+    const opts=cps.map(m=>`<option value="${m.id}" ${h.model===m.id?'selected':''}>${esc(m.name)}</option>`).join('');
+    $('#app').innerHTML=`<h2>高质量图片</h2>${tabHtml(3)}
+      <div class="box"><b>这个功能分两步:</b>先单独生成一张脸并保存,确认后再锁住这张脸生成旗袍和不同身材比例的版本。每个版本都会单独归档。</div>
+      <label>生图模型(锁脸需要 SDXL 单文件模型)</label><select id="hqmodel" onchange="ST.hq.model=this.value">${opts}</select>
+      <label>脸部参考提示词(系统已预填,可以修改)</label><textarea id="hqfacep" style="height:92px">${esc(h.facePrompt)}</textarea>
+      <label>负向提示词</label><textarea id="hqneg" style="height:56px">${esc(h.neg)}</textarea>
+      <div class="row"><span><label>脸部参考尺寸</label><select onchange="ST.hq.faceSize=this.value"><option value="1024x1024">1024×1024</option><option value="832x1216">832×1216</option></select></span>
+      <span class="small" style="align-self:flex-end">先生成脸,满意后再进入身材参数</span></div>
+      <p><button onclick="hqStartFace()">🎭 先生成脸部参考</button><button class="back" onclick="home()">← 返回</button></p>`;
+  }
+  if(ST.step===91){
+    const h=ST.hq;
+    $('#app').innerHTML=`<h2>高质量图片 · 确认脸部</h2>${tabHtml(3)}
+      <div class="box">这张脸会作为后续图片的参考。满意就锁定,不满意可以重新生成。</div>
+      ${h.faceUrl?`<img class="out" src="${h.faceUrl}?t=${Date.now()}" style="max-width:520px;width:100%;display:block;margin:auto">`:'<div class="box"><span class="spin"></span> 正在生成脸部参考…</div>'}
+      ${h.faceError?`<div class="box" style="color:#d03050">生成失败:${esc(h.faceError)}</div>`:''}
+      <p><button onclick="hqStartFace()">🔁 重新生成脸</button>
+      ${h.faceUrl?'<button onclick="hqAcceptFace()">🔒 锁定这张脸,设置身材</button>':''}
+      <button class="back" onclick="goStep(90)">← 返回修改提示词</button></p>`;
+    if(h.facePid&&!h.faceDone&&!h.facePolling) hqPollFace();
+  }
+  if(ST.step===92){
+    const h=ST.hq;
+    $('#app').innerHTML=`<h2>高质量图片 · 身材和服装</h2>${tabHtml(3)}
+      <div class="row" style="align-items:flex-start"><img class="cardthumb" src="${h.faceUrl}" style="width:120px;height:120px;object-fit:cover"><div class="small">🔒 脸部已锁定<br>后面每次调整参数都会生成新文件,旧文件不会覆盖。</div></div>
+      <label>服装和场景提示词(已预填旗袍)</label><textarea id="hqbpos" style="height:100px">${esc(h.bodyPrompt||'full-body adult East Asian woman with long loose black hair, wearing an elegant red silk qipao, graceful Chinese fairy-like beauty, luxury editorial fashion photography, ornate Chinese interior, neutral porcelain skin tone, cool soft studio lighting, balanced white balance, realistic skin texture')}</textarea>
+      <div class="row" style="flex-wrap:wrap"><span><label>胸围比例</label><select id="hqbust" onchange="ST.hq.bust=this.value"><option value="natural">自然</option><option value="full">丰满</option><option value="very_full">夸张</option></select></span>
+      <span><label>腰部比例</label><select id="hqwaist" onchange="ST.hq.waist=this.value"><option value="natural">自然</option><option value="slim">纤细</option><option value="very_slim">明显纤细</option></select></span>
+      <span><label>臀胯比例</label><select id="hqhip" onchange="ST.hq.hip=this.value"><option value="natural">自然</option><option value="full">丰满</option><option value="very_full">夸张</option></select></span>
+      <span><label>生成数量</label><select id="hqcount" onchange="ST.hq.count=+this.value">${[1,2,3,4].map(n=>`<option value="${n}">${n} 张</option>`).join('')}</select></span></div>
+      <label>尺寸</label><select id="hqsize" onchange="ST.hq.size=this.value"><option value="832x1216">832×1216 竖图(推荐)</option><option value="1024x1536">1024×1536 高质量</option><option value="1024x1024">1024×1024 半身</option></select>
+      <p><button onclick="hqStartVariants()">🚀 生成这一组并归档</button><button class="back" onclick="goStep(91)">← 重新选脸</button></p>`;
+    if(h.bust) $('#hqbust').value=h.bust; if(h.waist) $('#hqwaist').value=h.waist; if(h.hip) $('#hqhip').value=h.hip;
+    if(h.count) $('#hqcount').value=h.count; if(h.size) $('#hqsize').value=h.size;
+  }
+  if(ST.step===93){
+    const h=ST.hq; const done=h.variants.filter(v=>v.done).length;
+    const rows=h.variants.map((v,i)=>`<div class="card" style="cursor:default"><b>${esc(v.name)}</b> <span class="small">${v.done?'✅ 完成':v.error?'❌ '+esc(v.error):'⏳ 生成中…'}</span>${v.url?`<img class="out" src="${v.url}?t=${Date.now()}"><button class="back" onclick="hqChoose(${i})">${h.selected===i?'✅ 已选择':'选择这张'}</button><div class="small">已归档: output/high_quality/${esc(h.session)}/${esc(v.name)}.png</div>`:''}</div>`).join('');
+    $('#app').innerHTML=`<h2>高质量图片 · 结果</h2>${tabHtml(3)}<div class="box">本组完成 ${done}/${h.variants.length} 张。每次调整参数重新生成,都会追加新文件。</div>${rows}<p><button onclick="goStep(92)">🔁 继续调整再生成</button><button class="back" onclick="home()">🏠 回首页</button></p>`;
+    if(!h.variantPolling && done<h.variants.length) hqPollVariants();
+  }
   if(ST.step===4){
     let cards='';
     for(let i=0;i<ST.items.length;i++){
@@ -2090,68 +3082,166 @@ async function render(){
   }
   if(ST.step===10){
     const vm = await j('/api/vid/models');
-    if(!ST.vid) ST.vid={unet:vm.unets[0].id,lora:'none',pos:'',neg:'',w:640,h:352,frames:49,fps:24,stg:false,file:null,imgName:null,pid:null,url:null};
+    if(!ST.vid) ST.vid={unet:vm.unets[0].id,lora:'none',loras:[],pos:'',neg:'',aspect:'9:16',w:360,h:640,frames:49,fps:24,duration:2,stg:false,interpolate:false,style2d:false,textOnly:false,audioMode:'none',audioFile:null,file:null,imgName:null,pid:null,url:null};
     const v=ST.vid;
-    const unetCards=vm.unets.map((u,ui)=>`<div class="card drop-in ${v.unet===u.id?'sel':''}" style="animation-delay:${ui*90}ms" onclick="vSet('unet','${u.id}',1)"><b>${u.name}</b> <span class="mfield">${u.tag}</span><div class="small">${u.desc}</div></div>`).join('');
-    const loraOpts=vm.loras.map(l=>`<label style="display:block;margin:6px 0"><input type="radio" name="vlora" ${v.lora===l.id?'checked':''} onchange="vSet('lora','${l.id}')"> <b>${l.name}</b> <span class="small">${l.desc}</span></label>`).join('');
+    if(!Array.isArray(v.loras)) v.loras=v.lora&&v.lora!=='none'?[v.lora]:[];
+    if(!v.aspect){ const legacy={'360x640':'9:16','640x360':'16:9','512x512':'1:1','432x544':'4:5','480x640':'3:4','640x480':'4:3'}[v.w+'x'+v.h]; v.aspect=legacy||'custom'; v.customRes=!legacy; }
+    if(v.duration==null) v.duration=Math.max(1,Math.round(v.frames/(v.fps||24)));
+    if(!v.audioMode) v.audioMode='none';
+    const unetCards=vm.unets.map((u,ui)=>`<div class="card drop-in ${v.unet===u.id?'sel':''}" data-vmodel="${u.id}" style="animation-delay:${ui*90}ms;${u.ready===false?'opacity:.62':''}" onclick="vPickModel('${u.id}')"><b>${u.name}</b> <span class="mfield">${u.tag}</span>${u.ready===false?'<span class="small" style="color:#e0556b"> · 正在安装</span>':''}<div class="small">${u.desc}</div></div>`).join('');
+    const loraOpts=vm.loras.filter(l=>l.id!=='none').map(l=>`<label style="display:block;margin:6px 0"><input type="checkbox" name="vlora" value="${l.id}" ${v.loras.includes(l.id)?'checked':''} onchange="vToggleLora('${l.id}',this.checked)"> <b>${l.name}</b> <span class="small">${l.desc}</span></label>`).join('');
     const imgHtml = v.file
       ? `<b style="color:#18a058">✔ ${esc(v.file.name)}</b><br><img src="${URL.createObjectURL(v.file)}" alt="">`
       : `把源图拖到这里,或点击选择<br><span class="small">视频会让这张图动起来</span>`;
-    $('#app').innerHTML = `<h2>图生视频</h2>
-      <p class="small">选视频模型 → 上传源图 → 写"<b>动作</b>"(不是场景) → 开始</p>
+    $('#app').innerHTML = `<h2>视频生成</h2><div class="vid-workspace"><section class="vid-main">
+      <p class="small">选择一个视频模型，上传源图，再用动作提示词告诉模型画面怎么动。</p>
+      <label class="vt-toggle"><input type="checkbox" ${v.style2d?'checked':''} onchange="vSetStyle2d(this.checked)"> 2D 动漫模式（自动加动漫 LoRA 和 2D 提示词）</label>
       ${unetCards}
+      <div class="small">2D 模式默认建议使用动漫图片垫图；勾选下面的“纯文字”后可不上传图片，但画风稳定性会差一些。</div>
+      <label class="vt-toggle"><input type="checkbox" ${v.textOnly?'checked':''} onchange="vSetTextOnly(this.checked)"> 纯文字生成（不使用垫图）</label>
       <label>源图</label>
-      <div class="drop" ondragover="event.preventDefault();this.classList.add('over')"
+      <div class="drop" style="${v.textOnly?'opacity:.45;pointer-events:none':''}" ondragover="event.preventDefault();this.classList.add('over')"
            ondragleave="this.classList.remove('over')" ondrop="vDrop(event)"
            onclick="$('#vfile').click()">${imgHtml}</div>
       <input type="file" id="vfile" accept="image/*" style="display:none" onchange="vSetFile(this.files[0])">
-      <label>动作提示词(描述要做的动作,如: she turns around and smiles)</label>
-      <textarea id="vpos" placeholder="写动作,不写场景">${esc(v.pos)}</textarea>
-      <label>风格 LoRA(可叠加,白话说明)</label>${loraOpts}
-      <div class="row">
-        <span><label>分辨率</label><select onchange="vRes(this.value)">
-          <option value="640x352" ${v.w===640?'selected':''}>640 × 352</option>
-          <option value="512x288" ${v.w===512?'selected':''}>512 × 288(更快)</option></select></span>
-        <span><label>帧数 <span id="vfnum">${v.frames}</span></label>
-          <input type="range" min="25" max="97" step="8" value="${v.frames}" oninput="vFrames(this.value)"></span>
+      <label>动作提示词（告诉模型画面怎么动）</label>
+      <textarea id="vpos" placeholder="例如：她慢慢转身看向镜头，头发和衣角随风摆动，轻轻呼吸">${esc(v.pos)}</textarea>
+      <div class="small">常用写法：<b>slowly turns around</b>（慢慢转身）、<b>walks forward</b>（向前走）、<b>hair and clothes move naturally</b>（头发和衣服自然摆动）。想要 LTX 生成现场声，可以加 <b>footsteps, breathing, clothes friction</b>（脚步、喘息、衣物摩擦）。</div>
+      <label>效果 LoRA（可多选，按勾选顺序叠加）</label>${loraOpts}<div class="small">动漫风=尽量保留二次元画风；动作增强=动作更明显；兽人向=兽人/特殊题材。它们不是同一种效果，叠得越多也越容易互相干扰。空间放大器、VAE、文本编码器都是系统配件，不在这里勾选。</div>
+      <div class="row" style="align-items:flex-end;flex-wrap:wrap">
+        <span><label>画面比例</label><select id="vres" onchange="vRes(this.value)">
+          ${[['360x640','9:16 竖屏(推荐)'],['640x360','16:9 横屏'],['512x512','1:1 方形'],['432x544','4:5 竖向'],['480x640','3:4 竖屏'],['640x480','4:3 横屏'],['custom','自定义尺寸']].map(s=>`<option value="${s[0]}" ${(s[0]==='custom' ? (v.customRes?'selected':'') : (v.w+'x'+v.h===s[0]&&!v.customRes?'selected':''))}>${s[1]}${s[0]==='custom'?'':' · '+s[0].replace('x','×')}</option>`).join('')}</select><span id="vAspectNote" class="small">当前 ${v.aspect||((v.w/v.h)<1?'竖屏':'横屏')} · ${v.w}×${v.h}</span></span>
+        <span id="vcustom" style="display:${v.customRes?'inline-flex':'none'};gap:6px;align-items:flex-end"><span><label>宽</label><input id="vwidth" type="number" min="64" step="16" value="${v.w}" onchange="vCustomSize()"></span><span><label>高</label><input id="vheight" type="number" min="64" step="16" value="${v.h}" onchange="vCustomSize()"></span></span>
+        <span><label>视频时长</label><select onchange="vDuration(this.value)">${[1,2,3,4,5,6,8,10,15,20,30,60].map(n=>`<option value="${n}" ${+v.duration===n?'selected':''}>${n} 秒</option>`).join('')}</select></span>
+        <span><label>帧率</label><select onchange="vFps(this.value)">${[[24,'24 fps'],[29.97,'30 fps (29.97)'],[59.94,'59 fps (59.94)'],[90,'90 fps']].map(s=>`<option value="${s[0]}" ${+v.fps===s[0]?'selected':''}>${s[1]}</option>`).join('')}</select></span>
+        <span><label>总帧数 <span id="vfnum">${v.frames}</span></label><input type="range" min="9" max="241" step="8" value="${v.frames}" oninput="vFrames(this.value)"></span>
       </div>
-      <p class="row"><label style="margin:0"><input type="checkbox" ${v.stg?'checked':''} onchange="vSet('stg',this.checked)"> STG 增强(动作更有力,稍慢)</label></p>
+      <p class="small">源图不会自动决定视频横竖；当前输出 <b>${v.aspect||'自定义'} · ${v.w}×${v.h}</b> · ${v.duration}秒 · ${v.frames}帧 · ${v.fps}fps。超过6秒会自动均分成小段（例如8秒=4+4），后台算完再拼成一个成片；超过24fps时先按24fps生成，再自动补帧。</p>
+      <p class="row" style="flex-wrap:wrap"><label style="margin:0"><input type="checkbox" ${v.interpolate?'checked':''} onchange="vSet('interpolate',this.checked)"> 生成后补帧到 60fps</label>
+        <label style="margin:0"><input type="checkbox" ${v.stg?'checked':''} onchange="vSet('stg',this.checked)"> STG 增强(动作更有力,稍慢)</label></p>
+      <div class="box" style="margin-top:8px"><b>声音</b><br><label style="margin:4px 0"><input type="radio" name="vaudio" value="none" ${v.audioMode==='none'?'checked':''} onchange="vAudioMode(this.value)"> 不添加声音</label>
+        <label style="margin:4px 0"><input type="radio" name="vaudio" value="native" ${v.audioMode==='native'?'checked':''} onchange="vAudioMode(this.value)"> LTX 原生声音（按提示词同时生成）</label>
+        <label style="margin:4px 0"><input type="radio" name="vaudio" value="upload" ${v.audioMode==='upload'?'checked':''} onchange="vAudioMode(this.value)"> 添加音频(上传环境声/配音)</label>
+        <input id="vaudiofile" type="file" accept="audio/*,video/*,.mp3,.wav,.m4a,.aac" style="display:${v.audioMode==='upload'?'block':'none'};margin-top:6px" onchange="vSetAudio(this.files[0])">
+        <span id="vaudioname" class="small">${v.audioMode==='native'?'LTX 会按动作和场景同时生成现场声音。':(v.audioFile?'已选择: '+esc(v.audioFile.name):'上传音频会在成片后混入。')}</span></div>
       <p><button onclick="vStart()">🚀 开始生成</button>
       <button class="back" onclick="home()">← 返回</button></p>
-      <p class="small">提示: 新放进 models/video/ 的模型要重启视频服务才会被识别。</p>`;
+      <p class="small">提示: 新放进 models/video/ 的模型要重启视频服务才会被识别。</p></section>
+      <aside class="vid-side"><div class="vid-side-head"><b>后台任务与历史成片</b><button class="back" onclick="vidTasksPanel()">刷新</button></div>
+      <div class="small">这里仅查看任务和硬盘里的成片，不会加载模型，也不会额外占模型内存。</div><div id="vidTasksPanel"><div class="vid-empty">正在读取…</div></div></aside></div>`;
+    vidTasksPanel();
   }
   if(ST.step===11){
     $('#app').innerHTML = `<h2>生成视频中…</h2>
-      <div class="box">🎬 正在生成,约 1~3 分钟… <span id="vel">0s</span></div>
+      <div class="box">🎬 正在生成… <span id="vel">0s</span><div id="vstep" class="small"></div></div>
       <div class="bar"><i id="vbar"></i></div>
       <div id="vout" style="margin-top:14px"></div>
+      <p><button class="back" onclick="vCancel()">⏹ 停止当前视频</button></p>
       <p id="vacts" style="display:none">
         <button onclick="ST.step=10;render()">🔁 再做一段</button>
         <button class="back" onclick="home()">🏠 回首页</button></p>`;
     vPoll();
   }
+  if(ST.step===12){
+    const v=ST.vid||{};
+    $('#app').innerHTML=`<div class="vid-detail"><h2>历史成片</h2>
+      <div class="box">这是硬盘里已经生成好的视频。播放它不会启动 H3 或普通视频模型，也不会占用模型内存。</div>
+      ${v.url?`<div class="small" style="margin-bottom:8px">${esc(v.taskName||'视频成片')}</div><video controls playsinline src="${esc(v.url)}"></video>`:'<div class="box">找不到这个视频文件。</div>'}
+      <p class="row"><button onclick="goStep(10)">← 返回视频生成</button><button class="back" onclick="home()">回首页</button></p></div>`;
+  }
   if(ST.step===20){
     const ms = await j('/api/llm/models');
     ST._llmModels = ms;
-    $('#app').innerHTML = `<h2>选语言模型</h2>` + ms.map((m,mi)=>`
+    const metalBox = '';
+    $('#app').innerHTML = `<h2>选语言模型</h2>${metalBox}` + ms.map((m,mi)=>`
       <div class="card drop-in ${m.exists?'':'dis'}" style="animation-delay:${mi*90}ms" onclick="${m.exists?`llmPick('${m.id}')`:''}">
-        <b>${m.name}</b> <span class="mfield">${m.tag}</span>
-        <div class="small">${m.desc}</div>
+        <b>${esc(m.name)}</b> <span class="mfield">${esc(m.tag||'')}</span> <span class="small">${m.backend==='metal'?'官方 Metal':(m.backend==='vmlx'?'vMLX / MLX Metal':'llama.cpp')}</span>
+        <div class="small">${esc(m.desc||'')}</div>
+        ${m.author_usage?`<div class="small" style="margin-top:5px;color:var(--muted)">作者建议：${esc(m.author_usage)}</div>`:''}
         <div><span class="mmem">💾 需 GPU 上限 ${m.gpu_mb}MB</span></div>
-        ${m.exists?'':'<div class="small" style="color:#d03050">模型文件缺失(检查 models/llm 软链)</div>'}
+        ${m.exists?'':`<div class="small" style="color:#d03050">${m.backend==='metal'?'未配置: '+esc(m.missing_reason||'请初始化 Metal'):m.backend==='vmlx'?'未配置: '+esc(m.missing_reason||'请检查 vMLX 环境'):'模型文件缺失(检查 models/llm 软链)'}</div>`}
       </div>`).join('') + `<p><button class="back" onclick="home()">← 返回</button></p>`;
   }
   if(ST.step===21){
-    const m=ST.llmModel; const p=m.prefs||{thinking:true,temp:0.7,max_tokens:8192};
+    const m=ST.llmModel; const isMetal=m.backend==='metal'; const isVmlx=m.backend==='vmlx'; const p=m.prefs||{thinking:true,temp:0.7,max_tokens:8192,mtp:false,codex_proxy:false,proxy_mode:0,ctx:32768,parallel:1,budget:-1,reasoning_level:'high'};
+    const proxyMode=Number.isInteger(+p.proxy_mode)?Math.max(0,Math.min(2,+p.proxy_mode)):(p.codex_proxy?1:0);
+    const _b=p.budget??-1, _c=+p.ctx||32768, _ctxPresets=[16384,32768,65536], _customCtx=!_ctxPresets.includes(_c);
     const thinkHtml = m.is_reasoning
-      ? `<p class="row"><label style="margin:0"><input type="checkbox" id="lthink" ${p.thinking?'checked':''}> 思考模式(先推理再回答,更聪明但慢)</label></p>`
-      : `<p class="small">此模型为快速应答型,无思考模式。</p>`;
+      ? `<div class="box"><b>🧠 思考设置</b>
+        <div class="row" style="margin:8px 0;align-items:center;gap:8px;flex-wrap:wrap">
+          <span id="lthinkFast" class="small" style="color:${p.thinking?'var(--muted)':'var(--text)'};font-weight:${p.thinking?'500':'700'}">极速模式</span>
+          <label style="position:relative;display:inline-block;width:38px;height:22px;cursor:pointer;vertical-align:middle">
+            <input type="checkbox" id="lthink" ${p.thinking?'checked':''} style="position:absolute;opacity:0;width:0;height:0" onchange="const on=this.checked; const ex=document.getElementById('lthinkExtra'); const mode=document.getElementById('lthinkMode'); const fast=document.getElementById('lthinkFast'); const deep=document.getElementById('lthinkDeep'); const track=document.getElementById('lthinkTrack'); const knob=document.getElementById('lthinkKnob'); if(ex) ex.style.display=on?'block':'none'; if(mode) mode.textContent=on?'深度思考模式':'极速模式'; if(fast){ fast.style.color=on?'var(--muted)':'var(--text)'; fast.style.fontWeight=on?'500':'700'; } if(deep){ deep.style.color=on?'var(--accent)':'var(--muted)'; deep.style.fontWeight=on?'700':'500'; } if(track) track.style.background=on?'var(--accent)':'var(--border)'; if(knob) knob.style.left=on?'19px':'3px';">
+            <span id="lthinkTrack" style="position:absolute;inset:0;background:${p.thinking?'var(--accent)':'var(--border)'};border-radius:999px;box-shadow:inset 0 0 0 1px rgba(0,0,0,.04);transition:.2s"></span>
+            <span id="lthinkKnob" style="position:absolute;top:3px;left:${p.thinking?'19px':'3px'};width:16px;height:16px;background:var(--card);border:1px solid rgba(0,0,0,.05);border-radius:50%;box-shadow:0 1px 3px rgba(0,0,0,.14);transition:.2s"></span>
+          </label>
+          <span id="lthinkDeep" class="small" style="color:${p.thinking?'var(--accent)':'var(--muted)'};font-weight:${p.thinking?'700':'500'}">深度思考模式</span>
+          <span class="small">当前: <b id="lthinkMode">${p.thinking?'深度思考模式':'极速模式'}</b></span>
+        </div>
+        <div class="small" style="margin-top:2px">💡 关闭 = 极速模式; 开启 = 深度思考模式。极速更快更稳,深度思考更慢但适合难题。</div>
+        <div id="lthinkExtra" style="display:${p.thinking?'block':'none'};margin-top:8px">
+          <label style="display:block;margin-top:2px">思考档位(想得多深)
+            <select id="llevel">
+              <option value="high" ${(p.reasoning_level||'high')==='high'?'selected':''}>high · 高(深度思考,最慢)</option>
+              <option value="medium" ${(p.reasoning_level||'high')==='medium'?'selected':''}>medium · 中(推荐)</option>
+              <option value="low" ${(p.reasoning_level||'high')==='low'?'selected':''}>low · 低(快,思考浅)</option>
+            </select></label>
+          <label style="display:block;margin-top:6px">思考长度(回答前最多想多少 token)
+            <select id="lbud">
+              <option value="-1" ${_b===-1?'selected':''}>-1 · 不限(随便想,默认)</option>
+              <option value="2048" ${_b===2048?'selected':''}>2048 · 简短思考(快,推荐)</option>
+              <option value="8192" ${_b===8192?'selected':''}>8192 · 深度思考(慢)</option>
+            </select>
+            <label style="margin-left:10px"><input type="checkbox" id="lbudc" onchange="document.getElementById('lbudget').style.display=this.checked?'inline-block':'none'"> 自定义</label>
+            <input type="number" id="lbudget" min="-1" max="32768" step="256" placeholder="0=不思考 · 正数=限N个token" style="display:none;width:200px"></label>
+          <div class="small" style="margin-top:2px">💡 -1=不限随便想 · 0=不思考直接答 · 正数=最多想N个token(如 1024/2048/4096)</div>
+        </div>
+      </div>`
+      : `<div class="box"><b>🧠 思考设置</b><p class="small" style="margin:4px 0">此模型为快速应答型,无思考模式。</p></div>`;
+    const mtpLabel = m.mtp_warning ? 'MTP（实验性，不建议开启）' : 'MTP 加速（每步尝试预判多个 token）';
+    const mtpHtml = !isMetal && m.has_mtp
+      ? `<div style="margin:6px 0"><label style="margin:0"><input type="checkbox" id="lmtp" ${p.mtp?'checked':''}> ${mtpLabel}</label>${m.mtp_warning?`<div class="small" style="color:#b54708;margin-top:5px">⚠ ${esc(m.mtp_warning)}</div>`:''}</div>`
+      : '';
+    const mtpNoteHtml = m.mtp_compatible===false ? `<div class="small" style="color:#a15c00;margin:5px 0">MTP 暂不可用：${esc(m.mtp_note||'侧车与主模型词表不兼容')}。当前只启动主模型，避免加载失败。</div>` : '';
+    const cpxHtml = m.supports_codex_proxy ? `<div class="box" style="margin:4px 0"><label style="margin:0">代理模式</label><div class="proxy-switch" role="group" aria-label="代理模式"><button type="button" data-proxy-mode="0" class="${proxyMode===0?'active':''}" onclick="selectProxyMode(0)">关闭</button><button type="button" data-proxy-mode="1" class="${proxyMode===1?'active':''}" onclick="selectProxyMode(1)">Codex</button><button type="button" data-proxy-mode="2" class="${proxyMode===2?'active':''}" onclick="selectProxyMode(2)">Claude</button></div><input type="hidden" id="lcpx" value="${proxyMode}"><div id="lcpxMode" class="small">当前：${['关闭','Codex 代理','Claude 代理'][proxyMode]}</div><div class="small" style="margin-top:5px">${isVmlx?'普通 OpenAI 请求可直连 vMLX；选择代理后为工具请求增加格式适配，后端转到内部端口。':'Codex 使用 Responses API，Claude 使用 Anthropic Messages API，代理会把对应请求转换为 llama.cpp 接口。'} 公共地址固定使用 8848，同一时间只能运行一种代理。</div></div>` : '';
+    const metalHint = isMetal ? `<div class="box"><b>官方 Metal 运行提示</b><div class="small" style="margin-top:5px">此模型走官方 GPT-OSS Responses API 和 Apple Metal 参考实现，不使用 llama.cpp/MTP/Codex 代理。需要先完成 Metal 初始化，并准备转换后的 model.bin。</div></div>` : '';
+    const vmlxHint = isVmlx ? `<div class="box"><b>vMLX / MLX Metal</b><div class="small" style="margin-top:5px">此模型使用项目内隔离的 .venv-vmlx，实体读取 models/llm 下的 MXFP4 权重；与 llama.cpp/其他模型互斥运行。作者推荐 temperature 1.0、top_p 0.95、top_k 20；本机实测为稳定性优先，默认温度 0.4 且关闭原生 MTP。当前版本开启 MTP 后容易重复循环，稳定使用请保持关闭。</div></div>` : '';
     $('#app').innerHTML = `<h2>${esc(m.name)} · 启动参数</h2>
+      ${metalHint}
+      ${vmlxHint}
+      ${m.author_source?`<div class="small" style="margin:5px 0;color:var(--muted)">作者资料：${esc(m.author_source)}</div>`:''}
       ${thinkHtml}
-      <label>温度(越高越发散) <span id="ltv">${p.temp}</span></label>
-      <input type="range" id="ltemp" min="0" max="1.5" step="0.1" value="${p.temp}" oninput="$('#ltv').textContent=this.value">
-      <label>最大回复长度(max_tokens)</label>
-      <select id="lmax">${[4096,8192,16384].map(n=>`<option value="${n}" ${p.max_tokens===n?'selected':''}>${n}</option>`).join('')}</select>
+      <div class="box"><b>📏 上下文与输出</b>
+        <label style="display:block;margin-top:2px">上下文大小(对话总容量: 历史+思考+回答)
+          <select id="lctx" onchange="document.getElementById('lctxcust').style.display=this.value==='custom'?'inline-block':'none'">
+            <option value="16384" ${_c===16384?'selected':''}>16384 · 省内存(普通聊天)</option>
+            <option value="32768" ${_c===32768?'selected':''}>32768 · 推荐(32GB 机器)</option>
+            <option value="65536" ${_c===65536?'selected':''}>65536 · 长上下文(更吃内存)</option>
+            <option value="custom" ${_customCtx?'selected':''}>自定义</option>
+          </select>
+          <input type="number" id="lctxcust" min="8192" max="131072" step="4096" value="${_customCtx?_c:''}" placeholder="自定义 8192~131072" style="display:${_customCtx?'inline-block':'none'};width:200px" oninput="if(document.getElementById('lctx').value!=='custom') document.getElementById('lctx').value='custom'"></label>
+        <div class="small" style="margin-top:2px">💡 越大越能记住长会话,越吃内存;32GB 机器建议 16K~32K</div>
+        <label style="display:block;margin-top:8px">并行会话数
+          <select id="lparallel">
+            <option value="1" ${(+p.parallel||1)===1?'selected':''}>1 · 最省内存（推荐）</option>
+            <option value="2" ${(+p.parallel||1)===2?'selected':''}>2 · 两个请求并行</option>
+            <option value="4" ${(+p.parallel||1)===4?'selected':''}>4 · 多请求并行</option>
+            <option value="custom" ${![1,2,4].includes(+p.parallel)?'selected':''}>自定义</option>
+          </select>
+          <input type="number" id="lparallelcust" min="1" max="8" step="1" value="${![1,2,4].includes(+p.parallel)?Math.max(1,Math.min(8,+p.parallel||1)):''}" placeholder="1~8" style="display:${![1,2,4].includes(+p.parallel)?'inline-block':'none'};width:90px" oninput="if(document.getElementById('lparallel').value!=='custom') document.getElementById('lparallel').value='custom'">
+        </label>
+        <div class="small" style="margin-top:2px">并行越高越容易占满统一内存；32GB 机器建议 1。</div>
+        <label style="display:block;margin-top:8px">温度(越低越严谨) <span id="ltv">${p.temp}</span>
+          <input type="range" id="ltemp" min="0" max="1.5" step="0.1" value="${p.temp}" oninput="$('#ltv').textContent=this.value"></label>
+        <div class="small" style="margin-top:2px">💡 此模型建议温度 <b>${esc(m.recommended_temp||'0.4~0.7')}</b>；越低越稳定严谨，过高更容易重复或跑偏。</div>
+        <label style="display:block;margin-top:8px">最大回复长度(max_tokens,单次回复上限)
+          <input type="number" id="lmax" min="512" max="65536" step="512" value="${p.max_tokens}" style="width:150px"></label>
+      </div>
+      <div class="box"><b>⚡ 加速与兼容</b>
+        ${mtpHtml}
+        ${mtpNoteHtml}
+        ${cpxHtml}
+      </div>
       <p><button onclick="llmStart()">🚀 启动</button>
       <button class="back" onclick="goStep(20)">← 返回</button></p>`;
   }
@@ -2188,9 +3278,10 @@ async function render(){
       return;
     }
     const port=c.port||8848;
+    const backendLabel=c.model.backend==='metal'?'官方 Metal':(c.model.backend==='vmlx'?'vMLX / MLX Metal':'llama.cpp');
     $('#app').innerHTML = `<h2>语言模型运行中</h2>
-      <div class="card" style="cursor:default"><b>💬 ${esc(c.model.name)}</b> <span class="dot on">● 运行中</span>
-        <div class="small">温度 ${c.model.temp} · max_tokens ${c.model.max_tokens}${c.model.thinking?' · 思考模式':''}</div></div>
+      <div class="card" style="cursor:default"><b>💬 ${esc(c.model.name)}</b> <span class="dot on">● 运行中</span> <span class="small">${backendLabel}</span>
+        <div class="small">温度 ${c.model.temp} · max_tokens ${c.model.max_tokens}${c.model.ctx?' · 上下文'+Math.round(c.model.ctx/1024)+'K':''}${c.model.thinking?' · 思考模式':''}${c.model.thinking&&c.model.budget>=0?' · 思考限'+c.model.budget+'t':''}${c.model.mtp?' · MTP加速':''}${c.model.proxy_mode===2?' · Claude代理':(c.model.proxy_mode===1?' · Codex代理':'')}</div></div>
       <div class="box">🔌 API 地址:<code>${esc(c.api_url)}</code>
         <button class="back" style="margin-left:8px" onclick="llmCopyApi('${c.api_url}')">复制</button></div>
       <div class="row" style="gap:26px;margin:14px 0">
@@ -2198,9 +3289,9 @@ async function render(){
         <span>🧮 token: 输入 <b id="llmPT">${c.prompt_tokens}</b> · 输出 <b id="llmGT">${c.gen_tokens}</b></span></div>
       <div class="row" style="margin:0 0 6px"><span>⚡ <b id="llmAct">${fmtAct(c.activity)}</b></span></div>
       <p style="text-align:center;margin:20px 0"><button onclick="llmPause()" style="padding:13px 40px;font-size:17px">⏸ 暂停</button></p>
-      <p class="row">
-        <button onclick="window.open('http://127.0.0.1:${port}')">💬 打开聊天网页</button>
-        <button onclick="goStep(23)">🎨 控制台聊天(说「画xx」自动生图)</button></p>
+      ${c.model.backend==='vmlx'
+        ? `<div class="box"><b>vMLX / MLX Metal 接口说明</b><div class="small" style="margin-top:5px">此模型由 vMLX 提供原生 OpenAI 兼容 API：<code>${esc(c.api_url)}</code>。默认直连；若启动页开启 vMLX 工具兼容代理，则由代理适配 Codex/MCP 请求。它不接入 ImageVideoStudio 的控制台聊天或“说画图”工作流；直接访问 8848 根地址或旧客户端的 <code>/props</code> 路径会出现 404，不代表模型故障。</div></div>`
+        : `<p class="row"><button onclick="window.open('http://127.0.0.1:${port}')">💬 打开聊天网页</button><button onclick="goStep(23)">🎨 控制台聊天(说「画xx」自动生图)</button></p>`}
       <p class="row">
         <button class="back" onclick="llmStop(0)">🔄 更换模型</button>
         <button class="back" onclick="llmStop(20)">🔄 更换语言模型</button>
@@ -2347,7 +3438,7 @@ async function render(){
           <button class="back" style="padding:5px 10px" onclick="wbSave(${s.id})">💾 保存台词</button>
           <span class="small">${s.text.length}字 · 改台词/换音色后会自动重录</span>
         </div>
-        ${body}
+        <div id="wbstatus-${s.id}">${body}</div>
       </div>`;
     };
     if(wb.merged){
@@ -2376,9 +3467,9 @@ async function render(){
           <button onclick="wbAdd()">＋ 加进列表(后台合成)</button>
         </div>
       </div>
-      <h3>段落(${wb.segs.length})${anyBusy?' <span class="small">· 后台合成中…</span>':''}</h3>
+      <h3>段落(${wb.segs.length}) <span id="wbBusyLabel" class="small">${anyBusy?'· 后台合成中…':''}</span></h3>
       ${wb.segs.length ? wb.segs.map(s=>segCard(s,false)).join('') : '<div class="box">还没有段落,先在上面加一段。</div>'}
-      <p><button onclick="wbMerge()" ${allDone?'':'disabled'}>🔒 全部满意,合并成一条</button>
+      <p><button id="wbMergeBtn" onclick="wbMerge()" ${allDone?'':'disabled'}>🔒 全部满意,合并成一条</button>
       <button class="back" onclick="wbReset()">🗑 清空重开</button>
       <button class="back" onclick="goStep(60)">← 回语音页</button></p>
       ${allDone?'':'<div class="small">全部段落生成完成后才能合并。</div>'}`;
@@ -2648,6 +3739,7 @@ async function render(){
   // ================= 图片测试场(⚙️齿轮) =================
   if(ST.step===70){ // 测试中心: 选类型 + 任务队列管理(暂停/杀/编辑/删除)
     const d = await j('/api/test/state');
+    const vd = await j('/api/video-test/state');
     const st = d.status||{};
     const statLine = d.worker_alive
       ? `<div class="card" style="cursor:default"><b>🟢 后台生图中</b> <span class="small">${esc(st.msg||'')}</span>
@@ -2662,27 +3754,98 @@ async function render(){
            <button class="back" onclick="cConfirm('连后台worker一起杀?队列里剩余任务也会停','全部杀掉').then(ok=>{if(ok)testCtl('kill_all')})">🛑 杀全部</button>
          </div></div>`
       : `<div class="box">后台没在跑。建好任务点「一键生图」就会自动起后台进程——<b>关这个网页、甚至关掉 start.sh,它都照跑</b>;想停只能来这里暂停/杀死,或在终端 <code>./start.sh</code> 选 4。</div>`;
+    const vst=vd.status||{};
+    const vcurrent=(vd.tasks||[]).find(t=>String(t.id)===String(vst.task))||{};
+    const vtiming=vcurrent.timing||{};
+    const vtimingLine=vtiming.average_sec
+      ? `<div class="small" style="margin-top:5px">本次实际平均约 <b>${videoFmtTime(vtiming.average_sec)}</b>/条 · 预计还需 ${videoFmtTime(vtiming.remaining_sec)}</div>`
+      : '';
+    const videoStatLine=vd.worker_alive
+      ? `<div class="card" style="cursor:default"><b>🟢 后台生视频中</b> <span class="small">${esc(vst.msg||'')}</span>
+         <div class="small" style="margin-top:4px">${vst.done||0}/${vst.total||0} 条成片 · ✓${vst.ok||0} · ✗${vst.fail||0}${vst.folder?` · 📁 ${esc(vst.folder)}`:''}</div>
+         ${vtimingLine}
+         <div class="row" style="margin-top:8px">
+           ${vst.state==='paused'?`<button class="back" onclick="videoTestCtl('resume')">▶ 继续</button>`:`<button class="back" onclick="videoTestCtl('pause')">⏸ 暂停</button>`}
+           <button class="back" onclick="cConfirm('停止当前视频任务?已完成的视频会保留','停止').then(ok=>{if(ok)videoTestCtl('kill_curr')})">⏹ 杀当前任务</button>
+           <button class="back" onclick="cConfirm('停止全部视频测试?队列后面的任务不会继续跑','全部停止').then(ok=>{if(ok)videoTestCtl('kill_all')})">🛑 杀全部</button>
+         </div></div>`
+      : `<div class="box">后台视频测试没在跑。创建任务后会自动启动；终端 <code>./start.sh</code> 选 5 可监控，选 6 可停止。</div>`;
     const taskRows = (d.tasks||[]).map(t=>{
       const nm = (t.models||[]).map(m=>esc(m.folder||m.name||m.id)).join('、');
-      const badge = {queued:'⏳ 排队中',running:'🟢 生成中',done:'✅ 完成',killed:'⏹ 被杀'}[t.state]||t.state;
+      const badge = {queued:'⏳ 排队中',running:'🟢 生成中',done:'✅ 完成',partial:'⚠️ 部分成功',failed:'❌ 失败',killed:'⏹ 被杀'}[t.state]||t.state;
       return `<div class="card" style="cursor:default">
         <b>任务 ${esc(t.id)}</b> <span class="small">${badge}</span>
         <div class="small" style="margin-top:4px">${(t.models||[]).length}模型:${nm} · 每提示词${t.per_prompt}张 · 画布${t.canvas.w}×${t.canvas.h}${t.pad_ref?' · 垫图':''}${(t.face_lock||{}).enabled?' · 锁脸':''}</div>
         <div class="row" style="margin-top:8px">
           <button class="back" onclick="testEditPrompts('${t.id}')">✏️ 提示词</button>
-          ${t.state==='done'||t.state==='killed'?`<button class="back" onclick="testRerun('${t.id}')">🔁 原样重跑</button>
+          ${['done','partial','failed','killed'].includes(t.state)?`<button class="back" onclick="testRerun('${t.id}')">🔁 原样重跑</button>
           <button class="back" onclick="testRerunEdit('${t.id}')">📝 改配置重跑</button>`:''}
           <button class="back" onclick="cConfirm('删任务 ${esc(t.id)}?只删配置和提示词,已生成的图片保留','删除').then(ok=>{if(ok)testDel('${t.id}')})">🗑 删除</button>
         </div></div>`;
     }).join('');
-    $('#app').innerHTML = `<h2>⚙️ 测试场</h2>
-      <div class="card" onclick="testNew()"><b>🖼️ 图片测试</b> <span class="dot on">● 已开放</span><div class="small">多模型/垫图/锁脸,一套提示词批量试,后台队列跑</div></div>
-      <div class="card" style="opacity:.45;cursor:not-allowed"><b>🎙 语音测试</b> <span class="dot off">○ 未开放</span><div class="small">敬请期待</div></div>
-      <h3 style="margin:14px 0 6px">后台状态</h3>${statLine}
-      <h3 style="margin:14px 0 6px">任务队列 <span class="small">(提示词统一存 ${esc(d.prompt_dir)},删任务只留图)</span></h3>
-      ${taskRows||'<div class="box">还没有任务,点上面「图片测试」建一个</div>'}
-      <p><button class="back" onclick="home()">🏠 回首页</button>
-      <button class="back" onclick="render()">🔄 刷新</button></p>`;
+    const videoRows=(vd.tasks||[]).map(t=>{
+      const nm=(t.models||[]).map(m=>esc(m.folder||m.name||m.id)).join('、');
+      const badge={queued:'⏳ 排队中',running:'🟢 生成中',done:'✅ 完成',partial:'⚠️ 部分成功',failed:'❌ 失败',killed:'⏹ 被杀'}[t.state]||t.state;
+      const vars=(t.variants||[]).map(v=>`${v.w}×${v.h}/${v.duration}秒/${v.fps}fps`).join('、');
+      const outputLinks=(t.outputs||[]).slice(-4).map(p=>{const rel=String(p).replace(/^output\/vidtest\//,'');return `<a href="/vidtest/${encodeURI(rel)}" target="_blank">${esc(rel.split('/').pop())}</a>`}).join(' · ');
+      return `<div class="card" style="cursor:default"><b>视频任务 ${esc(t.id)}</b> <span class="small">${badge}</span>
+        <div class="small" style="margin-top:4px">${(t.models||[]).length}模型:${nm} · ${t.mode==='t2v'?'纯文字':'垫图'+(t.refs||[]).length+'张'} · ${vars} · 每组${t.copies||1}段</div>
+        ${outputLinks?`<div class="small" style="margin-top:5px">成品：${outputLinks}</div>`:''}
+        <div class="row" style="margin-top:8px"><button class="back" onclick="videoTestEditPrompts('${t.id}')">✏️ 提示词</button>
+          ${['done','partial','failed','killed'].includes(t.state)?`<button class="back" onclick="videoTestRerun('${t.id}')">🔁 原样重跑</button><button class="back" onclick="videoTestRerunEdit('${t.id}')">📝 改配置重跑</button>`:''}
+          <button class="back" onclick="cConfirm('删除视频任务 ${esc(t.id)}?成品视频会保留','删除').then(ok=>{if(ok)videoTestDel('${t.id}')})">🗑 删除</button></div></div>`;
+    }).join('');
+    $('#app').innerHTML = `<div class="vt-page test-hub"><h2>⚙️ 测试场</h2>
+      <div class="test-hub-grid">
+        <div class="card test-entry" onclick="goStep(88)"><b>🖼️ 图片测试</b><div class="small">${d.worker_alive?`<span class="dot on">● 运行中</span> · ${st.done||0}/${st.total||0} 张`:'后台空闲'}</div><div class="small">图片任务、提示词和图片重试独立管理</div></div>
+        <div class="card test-entry" onclick="goStep(89)"><b>🎬 视频测试</b><div class="small">${vd.worker_alive?`<span class="dot on">● 运行中</span> · ${vst.done||0}/${vst.total||0} 条`:'后台空闲'}</div><div class="small">视频任务、成片文件夹和视频重试独立管理</div></div>
+      </div>
+      <div class="box">图片和视频的任务页面已经分开；内存保护仍然会阻止两种后台同时运行。</div>
+      <p><button class="back" onclick="home()">🏠 回首页</button></p></div>`;
+  }
+  if(ST.step===88){ // 图片测试任务管理页
+    const d=await j('/api/test/state'), st=d.status||{};
+    const badge={queued:'⏳ 排队中',running:'🟢 生成中',done:'✅ 完成',partial:'⚠️ 部分成功',failed:'❌ 失败',killed:'⏹ 被杀'};
+    const rows=(d.tasks||[]).map(t=>{
+      const nm=(t.models||[]).map(m=>esc(m.folder||m.name||m.id)).join('、');
+      return `<div class="card" style="cursor:default"><b>图片任务 ${esc(t.id)}</b> <span class="small">${badge[t.state]||t.state}</span>
+        <div class="small">${(t.models||[]).length}模型：${nm} · 每提示词${t.per_prompt}张 · ${t.canvas.w}×${t.canvas.h}</div>
+        <div class="row" style="margin-top:8px"><button class="back" onclick="testEditPrompts('${t.id}')">✏️ 图片提示词</button>
+          ${['done','partial','failed','killed'].includes(t.state)?`<button class="back" onclick="testRerun('${t.id}')">🔁 图片原样重跑</button><button class="back" onclick="testRerunEdit('${t.id}')">📝 图片改配置重跑</button>`:''}
+          <button class="back" onclick="cConfirm('删除图片任务 ${esc(t.id)}？已生成图片会保留','删除').then(ok=>{if(ok)testDel('${t.id}')})">🗑 删除</button></div></div>`;
+    }).join('');
+    const controls=d.worker_alive?`<div class="card" style="cursor:default"><b>🟢 图片后台运行中</b><div class="small">${esc(st.msg||'')} · ${st.done||0}/${st.total||0} 张</div><div class="row" style="margin-top:8px">${st.state==='paused'?`<button class="back" onclick="testCtl('resume')">▶ 继续</button>`:`<button class="back" onclick="testCtl('pause')">⏸ 暂停</button>`}<button class="back" onclick="testCtl('kill_curr')">⏹ 杀当前图片任务</button><button class="back" onclick="testCtl('kill_all')">🛑 停止图片后台</button></div></div>`:'<div class="box">图片后台当前空闲。</div>';
+    $('#app').innerHTML=`<div class="vt-page"><h2>🖼️ 图片测试任务</h2><div class="row"><button onclick="testNew()">＋ 新建图片测试</button><button class="back" onclick="goStep(70)">← 测试场首页</button></div>${controls}<h3>图片任务列表</h3>${rows||'<div class="box">还没有图片任务。</div>'}<p><button class="back" onclick="render()">🔄 刷新</button></p></div>`;
+  }
+  if(ST.step===89){ // 视频测试任务管理页，和图片页面完全分开
+    const vd=await j('/api/video-test/state'), s=vd.status||{};
+    const badge={queued:'⏳ 排队中',waiting_engine:'⏳ 等当前视频后台结束',running:'🟢 生成中',done:'✅ 完成',partial:'⚠️ 部分成功',failed:'❌ 失败',killed:'⏹ 被停止',interrupted:'⏸ 上次未完成',paused:'⏸ 已暂停'};
+    const rows=(vd.tasks||[]).map(t=>{
+      const nm=(t.models||[]).map(m=>esc(m.output_folder||m.folder||m.name||m.id)).join('、');
+      const vars=(t.variants||[]).map(v=>`${v.w}×${v.h}/${v.duration}秒/${v.fps}fps`).join('、');
+      const links=(t.outputs||[]).slice(-6).map(p=>{const rel=String(p).replace(/^output\/vidtest\//,'');return `<a href="/vidtest/${encodeURI(rel)}" target="_blank">${esc(rel.split('/').pop())}</a>`}).join(' · ');
+      const canRetry=['done','partial','failed','killed'].includes(t.state);
+      const progress=t.progress||{};
+      const timing=t.timing||{};
+      const resumeLine=t.resume_available
+        ? `<div class="small" style="margin-top:6px;color:var(--accent)">上次停在：已完成 <b>${progress.done||0}/${progress.total||'?'}</b> 条${progress.model?`，当前模型：${esc(progress.model)}`:''}。正在生成的这一条会从头重做。</div>`
+        : '';
+      const timingLine=timing.average_sec
+        ? `<div class="small" style="margin-top:5px">本次实际平均：约 <b>${videoFmtTime(timing.average_sec)}</b>/条 · 已运行 ${videoFmtTime(timing.elapsed_sec)} · 按当前速度还需约 ${videoFmtTime(timing.remaining_sec)}</div>`
+        : (timing.elapsed_sec?`<div class="small" style="margin-top:5px">本次已运行：${videoFmtTime(timing.elapsed_sec)}，完成第一条后会显示实际平均速度。</div>`:'');
+      return `<div class="card" style="cursor:default"><b>视频任务 ${esc(t.id)}</b> <span class="small">${badge[t.state]||t.state}</span>
+        <div class="small">${(t.models||[]).length}模型：${nm} · ${t.mode==='t2v'?'纯文字':'垫图'+(t.refs||[]).length+'张'} · ${vars} · 每组${t.copies||1}条</div>
+        ${(t.output_dirs||[]).length?`<div class="small">成片文件夹：${t.output_dirs.map(esc).join('、')}</div>`:''}
+        ${links?`<div class="small" style="margin-top:5px">最近成片：${links}</div>`:''}
+        ${resumeLine}
+        ${timingLine}
+        <div class="row" style="margin-top:8px"><button class="back" onclick="videoTestEditPrompts('${t.id}')">✏️ 视频提示词</button>
+          ${t.resume_available?`<button onclick="videoTestResume('${t.id}')">▶ 从断点继续</button>`:''}
+          ${canRetry?`<button class="back" onclick="videoTestRerun('${t.id}')">🔁 视频原样重跑</button><button class="back" onclick="videoTestRerunEdit('${t.id}')">📝 视频改配置重跑</button>`:''}
+          <button class="back" onclick="cConfirm('删除视频任务 ${esc(t.id)}？成片和分段工作文件都会删除','删除').then(ok=>{if(ok)videoTestDel('${t.id}')})">🗑 删除成片和临时文件</button></div></div>`;
+    }).join('');
+    const controls=vd.worker_alive?`<div class="card" style="cursor:default"><b>🟢 视频后台运行中</b><div class="small">${esc(s.msg||'')} · ${s.done||0}/${s.total||0} 条</div><div class="row" style="margin-top:8px">${s.state==='paused'?`<button class="back" onclick="videoTestCtl('resume')">▶ 继续</button>`:`<button class="back" onclick="videoTestCtl('pause')">⏸ 暂停</button>`}<button class="back" onclick="videoTestCtl('kill_curr')">⏹ 杀当前视频任务</button><button class="back" onclick="videoTestCtl('kill_all')">🛑 停止视频后台</button></div></div>`:'<div class="box">视频后台当前空闲。</div>';
+    $('#app').innerHTML=`<div class="vt-page"><h2>🎬 视频测试任务</h2><div class="row"><button onclick="videoTestNew()">＋ 新建视频测试</button><button class="back" onclick="goStep(70)">← 测试场首页</button></div>${controls}<h3>视频任务列表</h3>${rows||'<div class="box">还没有视频任务。</div>'}<p><button class="back" onclick="render()">🔄 刷新</button></p></div>`;
   }
   if(ST.step===71){ // 向导①: 选模型(多选)
     const d = await j('/api/test/state');
@@ -2701,7 +3864,7 @@ async function render(){
       <p><button class="back" onclick="goStep(70)">← 取消</button>
       <button onclick="if(ST.test.models.length)goStep(72);else cAlert('至少选一个模型')">下一步 →</button></p>`;
   }
-  if(ST.step===72){ // 向导②: 每个模型的输出文件夹名(默认模型名)
+  if(ST.step===72){ // 向导②: 每个模型的安全输出文件夹名
     const T = ST.test;
     const rows = T.models.map((m,i)=>`
       <div class="row" style="margin-top:6px;align-items:center">
@@ -2710,8 +3873,15 @@ async function render(){
           style="flex:1;padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:var(--input);color:var(--text);font-size:13px">
       </div>`).join('');
     $('#app').innerHTML = `<h2>图片测试 ② 输出文件夹</h2>
-      <div class="box">每个模型的图存到 <code>output/imgtest/&lt;文件夹名&gt;/</code>,默认用模型名,可改。</div>
+      <div class="box">每个模型的图存到 <code>output/imgtest/&lt;文件夹名&gt;/</code>。系统会自动把空格、点号和其他符号改成下划线，避免文件夹名称报错。</div>
       ${rows}
+      <div class="box" style="margin-top:10px"><b>批量追加名称</b>
+        <div class="row" style="margin-top:8px;flex-wrap:wrap;align-items:flex-end">
+          <span><label>所有文件夹末尾追加</label><input id="tfolderSuffix" value="${esc(T.folder_suffix||'')}" placeholder="例如 _v2"></span>
+          <span><label>所有图片文件名末尾追加</label><input id="tfileSuffix" value="${esc(T.file_suffix||'')}" placeholder="例如 _v2"></span>
+        </div>
+        <div class="small">输入 <b>v2</b> 或 <b>_v2</b> 都可以。示例：文件夹变成 <code>模型名_v2</code>，图片变成 <code>p01_1_v2.png</code>。</div>
+      </div>
       <p><button class="back" onclick="goStep(71)">← 上一步</button>
       <button onclick="testSetFolders(${T.models.length})">下一步 →</button></p>`;
   }
@@ -2789,7 +3959,7 @@ async function render(){
       <div class="card" style="cursor:default">
         <b>${T.models.length} 个模型</b> × <b>${plist.length} 条提示词</b> × 每条 <b>${T.per} 张</b> = <b>${total} 张图</b>
         <div class="small" style="margin-top:6px">模型:${T.models.map(m=>esc(m.folder||m.name)).join('、')}</div>
-        <div class="small">画布:${T.canvas.w}×${T.canvas.h} · ${T.pad_ref?'垫图:'+esc(T.pad_ref):'不垫图'} · ${T.face_lock.enabled?'锁脸':'不锁脸'}</div>
+        <div class="small">画布:${T.canvas.w}×${T.canvas.h} · ${T.pad_ref?'垫图:'+esc(T.pad_ref):'不垫图'} · ${T.face_lock.enabled?'锁脸':'不锁脸'} · 文件夹后缀:${esc(T.folder_suffix||'无')} · 图片后缀:${esc(T.file_suffix||'无')}</div>
         <div class="small" style="margin-top:6px">提示词:<br>${plist.map(p=>'· '+esc(p)).join('<br>')}</div>
       </div>
       <div class="box">点「一键生图」后任务进队列,后台 worker 逐个跑。<b>这时你关网页、关 start.sh 都不影响</b>;想停回测试场暂停/杀死,或终端 <code>./start.sh</code> 选 4。</div>
@@ -2823,41 +3993,145 @@ async function render(){
   }
   if(ST.step===79){ // 网页编辑某任务的提示词
     const r = await j('/api/test/prompts?f='+encodeURIComponent(ST.testEditId||''));
-    $('#app').innerHTML = `<h2>✏️ 任务 ${esc(ST.testEditId||'')} 提示词</h2>
+    $('#app').innerHTML = `<h2>✏️ 图片任务 ${esc(ST.testEditId||'')} 提示词</h2>
       <div class="box">直接改,<b>一行一条</b>,保存即生效(正在跑的那张不受影响,下一张起用新词)。也可直接改文件 <code>${esc(r.path||'')}</code>。</div>
       <textarea id="tpe" style="height:200px">${esc(r.text||'')}</textarea>
-      <p><button class="back" onclick="goStep(70)">← 返回</button>
+      <p><button class="back" onclick="goStep(ST.testReturnStep||88)">← 图片任务</button>
       <button onclick="testSavePrompts()">💾 保存</button></p>`;
+  }
+  if(ST.step===80){ // 视频测试① 选模型
+    const d=await j('/api/video-test/state'); const V=ST.videoTest; V.all=d.models; V.loras=d.loras||[];
+    const cards=(d.models||[]).map((m,i)=>{const on=V.models.some(x=>x.id===m.id);const avg=m.actual_average_sec||0;const speed=avg?`本机平均约${avg}秒/段（${m.actual_samples}条成片）`:`登记约${m.sec||300}秒/段`;return `<div class="card drop-in ${on?'sel':''}" data-vtmodel="${m.id}" style="animation-delay:${i*70}ms" onclick="videoTestToggleModel('${m.id}','${esc(m.name)}',${avg||m.sec||300},this)"><b>${esc(m.name)}</b> <span class="small mtime ${secCls(avg||m.sec)}">${speed}</span><div class="small">${esc(m.desc||'')}${m.t2v_experimental?' · 纯文字为试验模式':''}</div></div>`}).join('');
+    $('#app').innerHTML=`<h2>视频测试 ① 选模型</h2><div class="box">可单选或多选。默认按预计生成时间从快到慢排队。已选 <b id="vtcount">${V.models.length}</b> 个。<button class="back" onclick="videoTestSelectAll()">☑ 全选/清空</button></div>${cards}<div class="box" id="vtorder">${videoTestOrderHtml()}</div><p><button class="back" onclick="goStep(89)">← 取消</button><button onclick="if(ST.videoTest.models.length)goStep(81);else cAlert('至少选一个视频模型')">下一步 →</button></p>`;
+  }
+  if(ST.step===81){ // 视频测试② 输出命名
+    const V=ST.videoTest;
+    videoTestSyncFolders();
+    const rows=V.models.map((m,i)=>`<div class="vt-name-row"><div class="vt-name-model"><span class="vt-name-index">${String(i+1).padStart(2,'0')}</span><div><strong>${esc(m.name)}</strong><small>${m.custom_name?'已自定义名称':'默认模型名称'}</small></div></div><div class="vt-name-control"><label for="vtf${i}">输出文件夹名称</label><div class="vt-name-control-line"><div class="vt-pretty-input vt-input-shell"><span class="vt-field-icon">📁</span><input id="vtf${i}" value="${esc(m.renaming?m.base_folder:m.folder)}" ${m.renaming?'':'disabled'} placeholder="模型默认名称"><span class="vt-folder-tail">/</span></div><button class="back vt-rename-btn" onclick="videoTestRename(${i})">${m.renaming?'保存':'重命名'}</button></div></div></div>`).join('');
+    $('#app').innerHTML=`<div class="vt-page"><h2>视频测试 ② 输出命名</h2><div class="box"><b>最终成片</b> 会放到 <code>output/vidtest/</code> 下；临时分段会放到任务工作目录。模型默认文件夹已锁定，点击右侧「重命名」后才能修改。</div><div class="vt-panel-title">本任务的模型文件夹</div><div class="vt-name-list">${rows}</div><div class="vt-panel-title">批量命名（可选）</div><div class="vt-name-options"><div class="vt-name-option"><label for="vtFolderSuffixInput">文件夹追加后缀</label><div class="vt-pretty-input"><span class="vt-field-icon">＋</span><input id="vtFolderSuffixInput" value="${esc(V.folder_suffix||'')}" placeholder="例如：_舞蹈"></div><div class="vt-name-option-actions"><button class="back" onclick="videoTestApplySuffix('folder')">应用</button><button class="back" onclick="videoTestRemoveSuffix('folder')">删除</button></div></div><div class="vt-name-option"><label for="vtFileSuffixInput">成片文件名追加后缀</label><div class="vt-pretty-input"><span class="vt-field-icon">Aa</span><input id="vtFileSuffixInput" value="${esc(V.file_suffix||'')}" placeholder="例如：_成片01"></div><div class="vt-name-option-actions"><button class="back" onclick="videoTestApplySuffix('file')">应用</button><button class="back" onclick="videoTestRemoveSuffix('file')">删除</button></div></div></div><div class="small vt-help">点击「应用」会替换当前后缀；需要多层命名时，直接在输入框中完整填写。</div><div class="vt-nav-actions"><button class="back" onclick="goStep(80)">← 上一步</button><button onclick="videoTestSetNames()">下一步 →</button></div></div>`;
+  }
+  if(ST.step===82){ // 视频测试③ T2V/I2V + 多垫图
+    const d=await j('/api/video-test/state'); const V=ST.videoTest;
+    const refs=(d.refs||[]).map(r=>`<div class="card vtref ${V.refs.includes(r.name)?'sel':''}" style="width:120px" onclick="videoTestToggleRef('${r.name}',this)"><img src="${r.url}" style="width:100%;border-radius:6px;pointer-events:none"><div class="small">${esc(r.name)}</div></div>`).join('');
+    $('#app').innerHTML=`<h2>视频测试 ③ 生成方式</h2><div class="row" style="gap:8px"><button class="${V.mode==='i2v'?'':'back'}" onclick="videoTestMode('i2v')">🖼️ 用图片做视频</button><button class="${V.mode==='t2v'?'':'back'}" onclick="videoTestMode('t2v')">📝 只写文字做视频</button></div><div class="box" style="margin-top:10px">${V.mode==='i2v'?'用一张或多张图片做参考，提示词主要写人物怎么动。通常更容易保持人物和画风。':'不上传图片，直接写人物、场景和动作。文字越具体，画面越容易稳定。'}</div><div id="vtrefs" style="display:${V.mode==='i2v'?'block':'none'}"><div class="row" style="flex-wrap:wrap;gap:8px">${refs||'<div class="box">参考图库里还没有图片，请先上传一张图片。</div>'}</div><div class="small">已选 <b id="vtrefcount">${V.refs.length}</b> 张</div></div><p><button class="back" onclick="goStep(81)">← 上一步</button><button onclick="videoTestRefsNext()">下一步 →</button></p>`;
+  }
+  if(ST.step===83){ // 视频测试④ 批量参数
+    const V=ST.videoTest; if(!Array.isArray(V.lora_ids))V.lora_ids=V.lora&&V.lora!=='none'?[V.lora]:[]; if(V.style_2d&&!V.lora_ids.includes('anime'))V.lora_ids.unshift('anime'); const loras=(V.loras||[]).filter(l=>l.id!=='none').map(l=>`<label class="vt-toggle" style="display:block;margin:6px 0"><input type="checkbox" name="vtlora" value="${l.id}" ${V.lora_ids.includes(l.id)?'checked':''}> <b>${esc(l.name)}</b> <span class="small">${esc(l.desc||'')}</span></label>`).join('');
+    const sizes=[[144,256,'144p 竖'],[180,320,'180p 竖'],[240,432,'240p 竖'],[360,640,'360p 竖'],[480,848,'480p 竖'],[720,1280,'720p 竖'],[1080,1920,'1080p 竖'],[256,144,'144p 横'],[320,180,'180p 横'],[432,240,'240p 横'],[640,360,'360p 横'],[848,480,'480p 横'],[1280,720,'720p 横'],[1920,1080,'1080p 横']];
+    const sizeHtml=sizes.map(s=>{const k=s[0]+'x'+s[1];return `<label class="vt-choice"><input type="checkbox" ${V.sizes.includes(k)?'checked':''} onchange="videoTestToggleArray('sizes','${k}',this.checked)"> <span>${s[2]}<small>${s[0]}×${s[1]}</small></span></label>`}).join('');
+    const durHtml=[1,2,3,4,5,6,8,10,15,20,30,60].map(n=>`<label class="vt-choice"><input type="checkbox" ${V.durations.includes(n)?'checked':''} onchange="videoTestToggleArray('durations',${n},this.checked)"><span>${n}秒</span></label>`).join('');
+    const fpsHtml=[[24,'24'],[29.97,'29.97'],[59.94,'59.94'],[90,'90']].map(n=>`<label class="vt-choice"><input type="checkbox" ${V.fpses.includes(n[0])?'checked':''} onchange="videoTestToggleArray('fpses',${n[0]},this.checked)"><span>${n[1]} fps</span></label>`).join('');
+    const style2dHtml=`<div class="box vt-param-panel"><label class="vt-toggle"><input id="vt2d" type="checkbox" ${V.style_2d?'checked':''}> 2D 动漫模式</label><div class="small">自动勾选“动漫/幻想风”，并在你的镜头和动作提示词后追加 2D、赛璐璐、手绘线稿等约束，同时排除 3D、写实和真人摄影感。</div></div>`;
+    $('#app').innerHTML=`<h2>视频测试 ④ 批量参数</h2><div class="box vt-param-panel"><div class="vt-panel-title">输出尺寸（可多选）</div><div class="vt-choice-grid">${sizeHtml}</div><div class="vt-form-grid"><span><label>自定义宽</label><input id="vtcw" type="number" min="64" max="1920" step="16" value="${V.custom.w}"></span><span><label>自定义高</label><input id="vtch" type="number" min="64" max="1920" step="16" value="${V.custom.h}"></span><button class="back" onclick="videoTestAddCustomSize()">＋ 加入自定义尺寸</button></div><div class="small">已选：${V.sizes.map(esc).join('、')||'无'}</div><div class="small">720p/1080p 会先用本机安全尺寸生成，全部拼好后再统一放大到目标尺寸。</div></div><div class="box vt-param-panel"><div class="vt-panel-title">成片时长（可多选）</div><div class="vt-choice-grid vt-choice-grid-short">${durHtml}</div><div class="small">超过6秒会自动均分，例如8秒=4+4、10秒=5+5；全部完成后再拼成一个成片。</div></div><div class="box vt-param-panel"><div class="vt-panel-title">最终帧率（可多选）</div><div class="vt-choice-grid vt-choice-grid-short">${fpsHtml}</div><div class="small">29.97/59.94/90fps 都先按最高24fps生成，再后期补到目标帧率。</div></div><div class="vt-form-grid"><span><label>每个组合生成几条成片</label><input id="vtcopies" type="number" min="1" max="10" value="${V.copies}"></span><span><label>风格 LoRA</label><select id="vtlora">${loras}</select></span><label class="vt-toggle"><input id="vtstg" type="checkbox" ${V.stg?'checked':''}> STG 时序稳定（LTX）</label><label class="vt-toggle"><input id="vtinterp" type="checkbox" ${V.interpolate?'checked':''}> 低帧率也补到60fps</label></div><div class="small vt-setting-note"><b>大白话：</b>STG 时序稳定是让画面更连贯、少闪烁；LoRA 里的「动作增强」是让动作幅度更大。它们不是一个东西，可以同时开。</div><p><button class="back" onclick="goStep(82)">← 上一步</button><button onclick="videoTestParamsNext()">下一步 →</button></p>`;
+    $('#app h2').insertAdjacentHTML('afterend',style2dHtml);
+    $('#vt2d').onchange=()=>{ V.style_2d=$('#vt2d').checked; if(V.style_2d&&!V.lora_ids.includes('anime'))V.lora_ids.unshift('anime'); if(!V.style_2d)V.lora_ids=V.lora_ids.filter(x=>x!=='anime'); render(); };
+    const nativeAudioNote=$('.vt-setting-note');
+    if(nativeAudioNote) nativeAudioNote.insertAdjacentHTML('beforebegin', `<label class="vt-toggle"><input id="vtnativeaudio" type="checkbox" ${V.native_audio?'checked':''}> LTX 原生声音</label>`);
+    const oldLora=$('#vtlora');
+    if(oldLora){ const wrap=oldLora.parentElement; wrap.innerHTML=`<label>效果 LoRA（可多选）</label>${loras}<div class="small">动漫风：尽量保留二次元画风；动作增强：动作更明显；兽人向：兽人/特殊题材。叠加越多，互相干扰的可能性越大。</div><div class="small">空间放大器只是把视频变大，不改变人物和画风；VAE、文本编码器都是模型运行所需的固定配件，都不是需要手动勾选的效果。</div>`; }
+    if(nativeAudioNote) nativeAudioNote.innerHTML=`<b>大白话：</b>打开「LTX 原生声音」后，LTX 会根据提示词同时生成喘息、喊叫、脚步、衣物摩擦等现场声音，不是后期硬塞音频。STG 时序稳定是让画面更连贯、少闪烁；LoRA 里的「动作增强」是让动作幅度更大。它们不是一个东西，可以同时开。`;
+  }
+  if(ST.step===84){
+    const V=ST.videoTest;
+    $('#app').innerHTML=`<h2>视频测试 ⑤ 提示词</h2><div class="box">一行就是一条测试内容，所有模型都会用同一行。用图片做视频时，主要写“怎么动”；只写文字时，要把“谁、在哪里、做什么”一起写清楚。</div><textarea id="vtprompts" style="height:180px" placeholder="她慢慢转身看向镜头，头发和衣角随风摆动，现场有轻微脚步声和呼吸声">${esc(V.prompts)}</textarea><div class="small">常用动作：slowly turns around（慢慢转身）、walks forward（向前走）、runs（奔跑）、looks at the camera（看向镜头）。动漫画面可加：2D anime、cel shading、flat colors、non-photorealistic；不想变真人可加负面词：realistic face、photorealistic、live action。</div><p><button class="back" onclick="goStep(83)">← 上一步</button><button onclick="videoTestPromptsNext()">下一步 →</button></p>`;
+  }
+  if(ST.step===85){
+    const V=ST.videoTest; const prompts=V.prompts.split('\n').filter(x=>x.trim()); const refs=V.mode==='t2v'?1:V.refs.length; const total=V.models.length*prompts.length*refs*V.variants.length*V.copies;
+    const sourceParts=V.models.reduce((sum,m)=>sum+V.variants.reduce((n,v)=>n+Math.max(1,Math.ceil(v.duration/6)),0),0)*prompts.length*refs*V.copies;
+    const estimateSec=videoEstimateSeconds(V.models,V.variants,prompts.length,refs,V.copies);
+    $('#app').innerHTML=`<h2>视频测试 ⑥ 确认</h2><div class="card" style="cursor:default"><b>共 ${total} 条最终成片</b><div class="small">后台预计拆成约 <b>${sourceParts}</b> 个安全分段逐个生成，再自动拼接。</div><div class="small">按模型登记速度估算：约 <b>${videoFmtTime(estimateSec)}</b>（实际会受分辨率、显存、当前电脑负载影响）</div><div class="small">${V.models.length}模型 × ${prompts.length}提示词 × ${V.mode==='t2v'?'纯文字':V.refs.length+'张垫图'} × ${V.variants.length}组参数 × 每组${V.copies}条</div><div class="small" style="margin-top:5px">执行顺序：${V.models.map(m=>esc(m.name)).join(' → ')}</div><div class="small">成片参数：${V.variants.map(v=>`${v.w}×${v.h}/${v.duration}秒/${v.fps}fps`).join('、')}</div></div><div class="box">每个分段都有超时保护；超时会自动缩短再试。分段即时落盘，最终成片另存，关闭网页不影响后台。</div><p><button class="back" onclick="goStep(84)">← 上一步</button><button onclick="videoTestGo()">🚀 启动视频测试</button></p>`;
+    const nativeConfirm=$('#app .card');
+    if(nativeConfirm) nativeConfirm.insertAdjacentHTML('beforeend', `<div class="small">LTX 原生声音：<b>${V.native_audio?'开':'关'}</b></div>`);
+  }
+  if(ST.step===86){
+    const d=await j('/api/video-test/state'); const s=d.status||{}; const pct=s.total?Math.round((s.done||0)/s.total*100):0;
+    const current=(d.tasks||[]).find(t=>String(t.id)===String(s.task))||{}; const tm=current.timing||{};
+    const timingLine=tm.average_sec?`<div class="small" style="margin-top:5px">本次实际平均约 <b>${videoFmtTime(tm.average_sec)}</b>/条 · 已运行 ${videoFmtTime(tm.elapsed_sec)} · 预计还需 ${videoFmtTime(tm.remaining_sec)}</div>`:`<div class="small" style="margin-top:5px">完成第一条成片后，页面会计算这台电脑的实际平均速度。</div>`;
+    $('#app').innerHTML=`<div class="vt-page"><h2>后台生视频${d.worker_alive?'中…':'(已停)'}</h2><div class="card" style="cursor:default"><b style="font-size:22px">${s.done||0}/${s.total||0}</b> 条成片 · <span style="color:var(--on)">✓${s.ok||0}</span> · <span style="color:#e0556b">✗${s.fail||0}</span><div class="small">${esc(s.msg||'')}</div>${s.segment_elapsed!=null?`<div class="small">本段已计算 ${s.segment_elapsed} 秒 · 超时保护剩余 ${s.watchdog_left||0} 秒 · ComfyUI:${esc(s.comfy_state||'running')}</div>`:''}${timingLine}${s.folder?`<div class="small">📁 ${esc(s.folder)}</div>`:''}<div class="bar" style="margin-top:8px"><i style="width:${pct}%"></i></div><div class="row" style="margin-top:8px">${s.state==='paused'?`<button class="back" onclick="videoTestCtl('resume')">▶ 继续</button>`:`<button class="back" onclick="videoTestCtl('pause')">⏸ 暂停</button>`}<button class="back" onclick="videoTestCtl('kill_curr')">⏹ 杀当前任务</button><button class="back" onclick="videoTestCtl('kill_all')">🛑 杀全部</button></div></div><div class="card" style="cursor:default"><div class="small" style="white-space:pre-wrap;font-family:monospace">${(s.log||[]).slice(-12).map(esc).join('\n')}</div></div><p><button class="back" onclick="goStep(89)">← 视频任务</button><button class="back" onclick="render()">🔄 刷新</button></p></div>`;
+    if(d.worker_alive) setTimeout(()=>{if(ST.step===86)render()},2500);
+  }
+  if(ST.step===87){
+    const r=await j('/api/video-test/prompts?f='+encodeURIComponent(ST.videoTestEditId||''));
+    $('#app').innerHTML=`<div class="vt-page"><h2>✏️ 视频任务 ${esc(ST.videoTestEditId||'')} 提示词</h2><div class="box">一行一条。保存后，尚未开始的下一段视频会读取新内容。</div><textarea id="vtpe" style="height:200px">${esc(r.text||'')}</textarea><p><button class="back" onclick="goStep(ST.videoReturnStep||89)">← 视频任务</button><button onclick="videoTestSavePrompts()">💾 保存</button></p></div>`;
   }
 }
 function newItem(){ return {mode:'t2i',w:1024,h:576,pos:'',neg:NEG_DEF,defPos:'masterpiece, best quality',strength:0.6,scale:2,ctype:'openpose',refFile:null,strokes:[],brush:30,poseSrc:'draw',joints:null,resultUrl:null}; }
 // ---- 视频 I2V 交互 ----
 function vSet(k,val,rerender){ ST.vid[k]=val; if(rerender) render(); }
-function vRes(s){ const[a,b]=s.split('x'); ST.vid.w=+a; ST.vid.h=+b; }
-function vFrames(n){ n=Math.round(n); ST.vid.frames=n; $('#vfnum').textContent=n; }
+function vToggleLora(id,on){ const v=ST.vid; if(!Array.isArray(v.loras))v.loras=[]; const i=v.loras.indexOf(id); if(on&&i<0)v.loras.push(id); if(!on&&i>=0)v.loras.splice(i,1); v.lora=v.loras[0]||'none'; }
+function vSetStyle2d(on){ const v=ST.vid; v.style2d=!!on; if(on&&!v.loras.includes('anime'))v.loras.unshift('anime'); if(!on){ const i=v.loras.indexOf('anime'); if(i>=0)v.loras.splice(i,1); } v.lora=v.loras[0]||'none'; render(); }
+function vSetTextOnly(on){ ST.vid.textOnly=!!on; render(); }
+function vPickModel(id){
+  ST.vid.unet=id;
+  document.querySelectorAll('[data-vmodel]').forEach(el=>el.classList.toggle('sel',el.dataset.vmodel===id));
+}
+function vRes(s){
+  if(s==='custom'){
+    ST.vid.aspect='custom';
+    ST.vid.customRes=true;
+    const box=$('#vcustom'); if(box) box.style.display='inline-flex';
+    return;
+  }
+  const[a,b]=s.split('x'); ST.vid.aspect=({'360x640':'9:16','640x360':'16:9','512x512':'1:1','432x544':'4:5','480x640':'3:4','640x480':'4:3'})[s]||s;
+  ST.vid.customRes=false; ST.vid.w=+a; ST.vid.h=+b;
+  const box=$('#vcustom'); if(box) box.style.display='none';
+  const note=$('#vAspectNote'); if(note) note.textContent=`当前 ${ST.vid.aspect} · ${ST.vid.w}×${ST.vid.h}`;
+}
+function vCustomSize(){
+  const w=Math.max(64,Math.round(+($('#vwidth')||{}).value||ST.vid.w));
+  const h=Math.max(64,Math.round(+($('#vheight')||{}).value||ST.vid.h));
+  ST.vid.w=Math.round(w/16)*16; ST.vid.h=Math.round(h/16)*16; ST.vid.customRes=true; ST.vid.aspect='custom';
+  if($('#vwidth')) $('#vwidth').value=ST.vid.w; if($('#vheight')) $('#vheight').value=ST.vid.h;
+  const note=$('#vAspectNote'); if(note) note.textContent=`当前自定义 · ${ST.vid.w}×${ST.vid.h}`;
+}
+function vFrameFor(sec,fps){
+  const raw=Math.max(9,Math.round(+sec*+fps));
+  return Math.max(9,Math.round((raw-1)/8)*8+1);
+}
+function vSyncFrames(){ ST.vid.frames=vFrameFor(ST.vid.duration,ST.vid.fps); const n=$('#vfnum'); if(n) n.textContent=ST.vid.frames; }
+function vDuration(n){ ST.vid.duration=+n; vSyncFrames(); }
+function vFps(n){ ST.vid.fps=+n; vSyncFrames(); }
+function vFrames(n){ n=Math.round(n); ST.vid.frames=n; ST.vid.duration=Math.max(0.1,n/(ST.vid.fps||24)); const d=document.querySelector('select[onchange="vDuration(this.value)"]'); if(d) d.value=''; const x=$('#vfnum'); if(x) x.textContent=n; }
 function vSetFile(f){ if(!f) return; ST.vid.file=f; render(); }
+function vAudioMode(mode){ ST.vid.audioMode=mode; const el=$('#vaudiofile'); if(el) el.style.display=mode==='upload'?'block':'none'; const n=$('#vaudioname'); if(n)n.textContent=mode==='native'?'LTX 会按动作和场景同时生成现场声音。':(mode==='upload'?(ST.vid.audioFile?'已选择: '+ST.vid.audioFile.name:'上传音频会在成片后混入。'):'不生成声音。'); }
+function vSetAudio(f){ if(!f) return; ST.vid.audioFile=f; const n=$('#vaudioname'); if(n) n.textContent='已选择: '+f.name; }
 function vDrop(e){ e.preventDefault(); e.currentTarget.classList.remove('over'); const f=e.dataTransfer.files[0]; if(f) vSetFile(f); }
 async function vStart(){
   const v=ST.vid; v.pos=$('#vpos').value;
-  if(!v.file){ cAlert('请先上传一张源图'); return; }
+  if(!v.textOnly&&!v.file){ cAlert('请先上传一张源图，或勾选“纯文字生成”'); return; }
+  if(v.audioMode==='upload' && !v.audioFile){ cAlert('你选择了添加音频,请先选择一个音频文件'); return; }
+  const sourceFps=Math.min(24,+v.fps||24), sourceFrames=vFrameFor(v.duration,sourceFps);
   $('#app').innerHTML = `<div class="box">📤 上传源图并提交…</div>`;
   try{
-    const fd=new FormData(); fd.append('image', v.file, v.file.name); fd.append('overwrite','true');
-    const ud=await (await fetch('/api/vid/upload',{method:'POST',body:fd})).json();
-    if(ud.error) throw new Error(ud.error);
+    let ud={name:''};
+    if(v.file && !v.textOnly){
+      const fd=new FormData(); fd.append('image', v.file, v.file.name); fd.append('overwrite','true');ud=await (await fetch('/api/vid/upload',{method:'POST',body:fd})).json();
+      if(ud.error) throw new Error(ud.error);
+    }
+    let audioName='';
+    if(v.audioMode==='upload' && v.audioFile){
+      const au=await (await fetch('/api/vid/audio?fname='+encodeURIComponent(v.audioFile.name),{method:'POST',body:v.audioFile})).json();
+      if(au.error) throw new Error(au.error); audioName=au.name||'';
+    }
     const d=await (await fetch('/api/vid/gen',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name:'vid_'+Date.now(),unet:v.unet,pos:v.pos,neg:v.neg,image:ud.name,
-        w:v.w,h:v.h,frames:v.frames,fps:v.fps,lora:v.lora,lora_strength:0.8,stg:v.stg,steps:8})})).json();
+      body:JSON.stringify({name:'vid_'+Date.now(),unet:v.unet,pos:v.pos,neg:v.neg,image:v.textOnly?'':ud.name,
+        w:v.w,h:v.h,duration:v.duration,frames:sourceFrames,fps:sourceFps,lora:(v.loras[0]||'none'),loras:v.loras,lora_strength:0.8,stg:v.stg,steps:8,
+        interpolate:!!v.interpolate,interpolate_fps:(+v.fps>sourceFps?+v.fps:(v.interpolate?60:0)),audio:audioName,native_audio:v.audioMode==='native',style_2d:!!v.style2d})})).json();
     if(d.error) throw new Error(d.error);
     v.pid=d.pid; ST.step=11; render();
   }catch(e){ $('#app').innerHTML = `<div class="box">提交失败:${esc(e.message)}</div><p><button onclick="ST.step=10;render()">← 返回</button></p>`; }
+}
+async function vCancel(){
+  const v=ST.vid;if(!v.pid)return;
+  const r=await (await fetch('/api/vid/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pid:v.pid})})).json();
+  if(r.error)cAlert('停止失败：'+r.error);else cAlert('停止指令已发送');
 }
 async function vPoll(){
   const v=ST.vid; const t0=Date.now();
   const t=setInterval(async()=>{
     if(ST.step!==11){ clearInterval(t); return; }
     let d; try{ d=await j('/api/vid/poll?pid='+v.pid); }catch(e){ return; }
-    const el=Math.round((Date.now()-t0)/1000); if($('#vel')) $('#vel').textContent=el+'s';
+    const el=Math.round(d.run_elapsed!=null?d.run_elapsed:(Date.now()-t0)/1000); if($('#vel')) $('#vel').textContent=fmtTime(el);
     if($('#vbar')) $('#vbar').style.width=Math.min(95,el/1.5)+'%';
     if(d.error){ clearInterval(t); $('#vout').innerHTML=`<div class="box">生成失败:${esc(d.error)}</div>`; $('#vacts').style.display='block'; return; }
     if(d.done){ clearInterval(t); if($('#vbar')) $('#vbar').style.width='100%';
@@ -2867,18 +4141,49 @@ async function vPoll(){
 }
 // ---- 语言模型交互 ----
 function llmPick(id){ ST.llmModel=(ST._llmModels||[]).find(m=>m.id===id); ST.step=21; render(); }
+function syncProxyMode(v){ const n=Math.max(0,Math.min(2,Math.round(+v||0))); const input=$('#lcpx'); if(input) input.value=n; document.querySelectorAll('[data-proxy-mode]').forEach(btn=>btn.classList.toggle('active',+btn.dataset.proxyMode===n)); const el=$('#lcpxMode'); if(el) el.textContent='当前：'+['关闭','Codex 代理','Claude 代理'][n]; }
+function selectProxyMode(v){ syncProxyMode(v); }
 async function llmStart(){
   const m=ST.llmModel;
-  const thinking=m.is_reasoning?($('#lthink')?$('#lthink').checked:m.prefs.thinking):false;
+  const thinking=m.is_reasoning?($('#lthink')?$('#lthink').checked:!!m.prefs.thinking):false;
   const temp=+($('#ltemp')?$('#ltemp').value:m.prefs.temp);
-  const max_tokens=+($('#lmax')?$('#lmax').value:m.prefs.max_tokens);
+  const max_tokens=Math.min(65536,Math.max(512,Math.round(+($('#lmax')?$('#lmax').value:m.prefs.max_tokens)||16384)));
+  const mtp=(m.backend==='metal'||!m.has_mtp)?false:(($('#lmtp')?$('#lmtp').checked:!!m.prefs.mtp));
+  const proxy_mode=(m.backend==='metal')?0:(($('#lcpx')?Math.max(0,Math.min(2,Math.round(+$('#lcpx').value||0))):Number.isInteger(+m.prefs.proxy_mode)?+m.prefs.proxy_mode:(m.prefs.codex_proxy?1:0)));
+  const codex_proxy=proxy_mode===1;
+  const csel=$('#lctx')?$('#lctx').value:String(m.prefs.ctx||32768);
+  const ccust=csel==='custom';
+  const ctx=ccust
+    ? Math.min(131072,Math.max(8192,Math.round(+($('#lctxcust')?$('#lctxcust').value:0)||32768)))
+    : csel;
+  const psel=$('#lparallel')?$('#lparallel').value:String(m.prefs.parallel||1);
+  const parallel=psel==='custom'
+    ? Math.min(8,Math.max(1,Math.round(+($('#lparallelcust')?$('#lparallelcust').value:1)||1)))
+    : Math.min(8,Math.max(1,parseInt(psel,10)||1));
+  const bv=$('#lbudget')?$('#lbudget').value:'';
+  const budget=m.is_reasoning
+    ? (($('#lbudc')&&$('#lbudc').checked)
+        ? (bv===''?-1:Math.max(-1,Math.round(+bv)))
+        : +($('#lbud')?$('#lbud').value:(m.prefs.budget??-1)))
+    : -1;
+  const reasoning_level=m.is_reasoning?($('#llevel')?$('#llevel').value:(m.prefs.reasoning_level||'high')):'high';
   $('#app').innerHTML = `<div class="box">🚀 正在启动 ${esc(m.name)}…<br><span class="small">会先停掉其他服务腾内存;若 GPU 上限不足,会弹一次 macOS 密码框。</span><div class="bar" style="margin-top:12px"><i class="indet"></i></div></div>`;
   const d=await (await fetch('/api/llm/start',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({id:m.id,thinking,temp,max_tokens})})).json();
+    body:JSON.stringify({id:m.id,thinking,temp,max_tokens,mtp,codex_proxy,proxy_mode,ctx,parallel,budget,reasoning_level})})).json();
   if(d.error){ let h=`<div class="box">启动失败:${esc(d.error)}</div>`;
     if(d.manual) h+=`<div class="box">可在终端手动运行(<code>!</code>前缀)后重试:<br><code>${esc(d.manual)}</code></div>`;
     h+=`<p><button onclick="goStep(21)">← 返回</button></p>`; $('#app').innerHTML=h; return; }
   ST.step=22; render();
+}
+async function llmMetalInit(){
+  $('#app').innerHTML=`<div class="box">正在初始化官方 Metal 环境…<br><span class="small">会创建 metal/.venv；如果已放入官方源码，会安装 gpt-oss[metal] 依赖。不会下载 model.bin。</span><div class="bar" style="margin-top:12px"><i class="indet"></i></div></div>`;
+  try{
+    const d=await j('/api/llm/metal/init',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    let h=`<div class="box">${esc(d.message||d.error||'Metal 初始化完成')}</div>`;
+    if(d.output) h+=`<div class="box"><pre style="white-space:pre-wrap;max-height:220px;overflow:auto">${esc(d.output)}</pre></div>`;
+    h+=`<p><button onclick="goStep(20)">返回语言模型</button></p>`;
+    $('#app').innerHTML=h;
+  }catch(e){ $('#app').innerHTML=`<div class="box">Metal 初始化失败:${esc(e)}</div><p><button onclick="goStep(20)">返回</button></p>`; }
 }
 async function llmStop(next){
   $('#app').innerHTML = `<div class="box"><span class="spin"></span> 正在停止语言模型…</div>`;
@@ -2888,6 +4193,17 @@ async function llmStop(next){
 }
 function fmtTime(s){ s=Math.max(0,Math.floor(s)); const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
   return (h?h+'小时':'')+(h||m?m+'分':'')+x+'秒'; }
+function videoFmtTime(s){
+  s=Number(s)||0;
+  if(s<=0) return '暂时无法估算';
+  return fmtTime(s);
+}
+function videoEstimateSeconds(models,variants,promptCount,refCount,copies){
+  return (models||[]).reduce((sum,m)=>sum+(variants||[]).reduce((part,v)=>{
+    const limit=6;
+    return part+Math.ceil(Number(v.duration||2)/limit)*(Number(m.sec)||300);
+  },0),0)*Math.max(1,promptCount||1)*Math.max(1,refCount||1)*Math.max(1,copies||1);
+}
 function fmtAct(a){ // "它正在干嘛"实时状态: 空闲/消化输入(带进度)/生成回复(带速度)
   if(!a) return '…';
   if(a.state==='idle') return '💤 空闲 · 等指令'+(a.tps?`(上次生成 ${a.tps.toFixed(1)} tok/s)`:'');
@@ -3084,13 +4400,31 @@ async function wbPost(path,obj){
   try{ return await (await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)})).json(); }
   catch(e){ return {error:'请求失败: '+e}; }
 }
-function wbMaybePoll(busy){ // 有段在后台跑就轮询刷新;但编辑聚焦时跳过,避免重渲染吃掉正在输入的字
+function wbStatusHtml(s){
+  if(s.status==='run'){
+    const cp=s.frame_max?(s.frame/s.frame_max):0;
+    const pct=Math.min(99,Math.round(((s.chunks_done+cp)/(s.chunk_count||1))*100));
+    return `<div class="bar"><i style="width:${pct}%"></i></div><div class="small">🔊 合成中 第${s.chunks_done+1}/${s.chunk_count}小段 · ${s.frame||0}帧</div>`;
+  }
+  if(s.status==='wait') return '<div class="small">⏳ 排队中…</div>';
+  if(s.status==='err') return `<div class="small" style="color:#d03050">✗ 失败:${esc(s.err||'合成失败')}</div>`;
+  return `<audio controls preload="none" src="/tts_out/${encodeURIComponent(s.wav)}" style="width:100%"></audio>`;
+}
+function wbMaybePoll(busy){ // 只更新每段状态，不整页重画，避免屏幕和播放器反复闪烁
   if(!busy) return;
-  setTimeout(()=>{
+  setTimeout(async()=>{
     if(ST.step!==61) return;
-    const a=document.activeElement;
-    if(a && (a.tagName==='TEXTAREA'||a.tagName==='INPUT'||a.tagName==='SELECT')){ wbMaybePoll(true); return; }
-    render();
+    let wb; try{ wb=await j('/api/wb/state'); }catch(e){ wbMaybePoll(true); return; }
+    if(ST.step!==61) return;
+    for(const s of (wb.segs||[])){
+      const box=$('#wbstatus-'+s.id);
+      if(box) box.innerHTML=wbStatusHtml(s);
+    }
+    const stillBusy=(wb.segs||[]).some(s=>s.status==='wait'||s.status==='run');
+    const allDone=(wb.segs||[]).length>0&&(wb.segs||[]).every(s=>s.status==='done');
+    const label=$('#wbBusyLabel'); if(label) label.textContent=stillBusy?'· 后台合成中…':'';
+    const merge=$('#wbMergeBtn'); if(merge) merge.disabled=!allDone;
+    wbMaybePoll(stillBusy);
   },1500);
 }
 async function wbAdd(){
@@ -3161,6 +4495,7 @@ async function wbReset(){
 function tabHtml(active){ // 图片区顶部面包屑切换: 单模型 / 预定批量 / 漫画连载
   return `<div class="tabs">
     <span class="tab ${active===0?'on':''}" onclick="goStep(1)">🖼️ 单模型生成</span>
+    <span class="tab ${active===3?'on':''}" onclick="hqOpen()">✨ 高质量图片</span>
     <span class="tab ${active===1?'on':''}" onclick="goStep(30)">📦 预定批量</span>
     <span class="tab ${active===2?'on':''}" onclick="goStep(40)">📖 漫画连载</span></div>`;
 }
@@ -3413,12 +4748,17 @@ async function ccStartGen(){ // 校验并启动自定义连载
 async function ccStop(){ await (await fetch('/api/cc/stop',{method:'POST'})).json(); }
 // ---- 图片测试场(⚙️) ----
 function secCls(sec){ sec=+sec||60; return sec<180?'g':(sec<=300?'y':'r'); }  // <3分钟绿 / 3~5分钟黄 / >5分钟红
-function testDefault(){ return {models:[],canvas:{w:832,h:1216},prompts:'',per:1,pad_ref:'',face_lock:{enabled:false,gen_model:'',prompt:''}}; }
+function testSafeFolderName(value){
+  const clean=String(value||'').trim().replace(/[^\p{L}\p{N}_-]+/gu,'_').replace(/_+/g,'_').replace(/^[_-]+|[_-]+$/g,'');
+  return clean.slice(0,80).replace(/[_-]+$/,'')||'model';
+}
+function testSafeSuffix(value){const raw=String(value||'').trim();const s=raw.replace(/[^\p{L}\p{N}_-]+/gu,'_').replace(/_+/g,'_').replace(/-+/g,'-').replace(/^[_-]+|[_-]+$/g,'').slice(0,40).replace(/[_-]+$/,'');return s?((raw.startsWith('-')?'-':'_')+s):'';}
+function testDefault(){ return {models:[],canvas:{w:832,h:1216},prompts:'',per:1,pad_ref:'',folder_suffix:'',file_suffix:'',face_lock:{enabled:false,gen_model:'',prompt:''}}; }
 function testNew(){ ST.test=testDefault(); ST.step=71; render(); }
 function testToggleModel(id,name,sec,el){
   const T=ST.test; const i=T.models.findIndex(x=>x.id===id);
   if(i>=0) T.models.splice(i,1);
-  else { T.models.push({id:id,name:name,folder:name,sec:sec||60});
+  else { T.models.push({id:id,name:name,folder:testSafeFolderName(name),sec:sec||60});
          T.models.sort((a,b)=>(a.sec||60)-(b.sec||60)); }   // 默认生图快的排前面
   if(!T.face_lock.gen_model && T.models.length) T.face_lock.gen_model=T.models[0].id;
   if(el) el.classList.toggle('sel', i<0);           // 原地切换选中态,不整页重渲(避免闪烁)
@@ -3444,7 +4784,7 @@ function testSelectAll(){ // 全选/清空: 一键把可选模型全加进来(�
   const T=ST.test; const all=T.all||[];
   if(!all.length) return;
   const allOn=all.every(m=>T.models.find(x=>x.id===m.id));
-  T.models = allOn ? [] : all.map(m=>({id:m.id,name:m.name,folder:m.name,sec:m.sec||60}));
+  T.models = allOn ? [] : all.map(m=>({id:m.id,name:m.name,folder:testSafeFolderName(m.name),sec:m.sec||60}));
   if(!allOn) T.models.sort((a,b)=>(a.sec||60)-(b.sec||60));   // 默认生图快的排前面
   if(!T.face_lock.gen_model && T.models.length) T.face_lock.gen_model=T.models[0].id;
   render();
@@ -3459,7 +4799,12 @@ function testDrop(e,to){ // 拖动换位: 把 from 项插到 to 项位置
 }
 function testSetFolders(n){
   const T=ST.test;
-  for(let i=0;i<n;i++){ const el=document.getElementById('tf'+i); if(el&&T.models[i]) T.models[i].folder=el.value.trim()||T.models[i].name; }
+  for(let i=0;i<n;i++){
+    const el=document.getElementById('tf'+i);
+    if(el&&T.models[i]) T.models[i].folder=testSafeFolderName(el.value||T.models[i].name);
+  }
+  T.folder_suffix=testSafeSuffix((document.getElementById('tfolderSuffix')||{}).value||'');
+  T.file_suffix=testSafeSuffix((document.getElementById('tfileSuffix')||{}).value||'');
   goStep(73);
 }
 function testSetCanvas(w,h){
@@ -3500,7 +4845,7 @@ async function testGo(){
   const T=ST.test;
   const body={models:T.models,canvas:T.canvas,per_prompt:T.per,
     prompts:T.prompts.split('\n').map(x=>x.trim()).filter(Boolean),
-    pad_ref:T.pad_ref,face_lock:T.face_lock};
+    pad_ref:T.pad_ref,face_lock:T.face_lock,folder_suffix:T.folder_suffix,file_suffix:T.file_suffix};
   const r=await (await fetch('/api/test/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
   if(r.ok){ ST.step=78; render(); } else { cAlert('创建失败: '+(r.error||'?')); }
 }
@@ -3522,16 +4867,46 @@ async function testRerunEdit(id){ // 改配置重跑: 把旧任务配置填回�
   const p=await j('/api/test/prompts?f='+encodeURIComponent(id));
   ST.test={models:(t.models||[]).map(m=>({...m})),canvas:{...t.canvas},prompts:p.text||'',
     per:t.per_prompt||1,pad_ref:t.pad_ref||'',
+    folder_suffix:t.folder_suffix||'',file_suffix:t.file_suffix||'',
     face_lock:t.face_lock||{enabled:false,gen_model:'',prompt:''}};
   ST.step=71; render();
 }
 async function testDel(id){ await (await fetch('/api/test/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})})).json(); render(); }
-function testEditPrompts(id){ ST.testEditId=id; goStep(79); }
+function testEditPrompts(id){ ST.testEditId=id; ST.testReturnStep=ST.step===88?88:70; goStep(79); }
 async function testSavePrompts(){
   const text=document.getElementById('tpe').value;
   await (await fetch('/api/test/prompts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:ST.testEditId,text:text})})).json();
-  goStep(70);
+  goStep(ST.testReturnStep||88);
 }
+// ---- 视频测试场 ----
+function videoTestDefault(){return {models:[],all:[],loras:[],lora_ids:[],mode:'i2v',refs:[],sizes:['360x640'],custom:{w:360,h:640},durations:[2],fpses:[24],variants:[{w:360,h:640,duration:2,fps:24}],copies:1,lora:'none',stg:false,interpolate:false,native_audio:true,style_2d:false,prompts:'',folder_suffix:'',file_suffix:''};}
+function videoTestNew(){ST.videoTest=videoTestDefault();ST.step=80;render();}
+function videoTestToggleModel(id,name,sec,el){const V=ST.videoTest,i=V.models.findIndex(x=>x.id===id);if(i>=0)V.models.splice(i,1);else{const base=testSafeFolderName(name);V.models.push({id,name,sec:sec||300,folder:base,base_folder:base,custom_name:false});V.models.sort((a,b)=>(a.sec||300)-(b.sec||300));}if(el)el.classList.toggle('sel',i<0);const c=$('#vtcount');if(c)c.textContent=V.models.length;const o=$('#vtorder');if(o)o.innerHTML=videoTestOrderHtml();}
+function videoTestOrderHtml(){const V=ST.videoTest;if(!V.models.length)return '执行顺序：还没选模型';return '执行顺序（默认快的在前，可拖动或点 ↑↓）：'+V.models.map((m,i)=>`<div class="small" draggable="true" ondragstart="videoTestDrag(event,${i})" ondragover="event.preventDefault()" ondrop="videoTestDrop(event,${i})" style="margin-top:4px;cursor:grab">⠿ <b>${i+1}.</b> ${esc(m.name)} · 约${m.sec||300}秒 <button class="back" style="padding:2px 8px" onclick="videoTestMove(${i},-1)">↑</button><button class="back" style="padding:2px 8px" onclick="videoTestMove(${i},1)">↓</button></div>`).join('');}
+function videoTestMove(i,d){const V=ST.videoTest,j=i+d;if(j<0||j>=V.models.length)return;[V.models[i],V.models[j]]=[V.models[j],V.models[i]];const o=$('#vtorder');if(o)o.innerHTML=videoTestOrderHtml();}
+function videoTestDrag(e,i){e.dataTransfer.setData('text/vtord',String(i));}
+function videoTestDrop(e,to){e.preventDefault();const V=ST.videoTest,from=+e.dataTransfer.getData('text/vtord');if(isNaN(from)||from===to)return;V.models.splice(to,0,V.models.splice(from,1)[0]);const o=$('#vtorder');if(o)o.innerHTML=videoTestOrderHtml();}
+function videoTestSelectAll(){const V=ST.videoTest,all=V.all||[];const on=all.length&&all.every(m=>V.models.some(x=>x.id===m.id));V.models=on?[]:all.map(m=>{const base=testSafeFolderName(m.name);return{id:m.id,name:m.name,sec:m.sec||300,folder:base,base_folder:base,custom_name:false}}).sort((a,b)=>a.sec-b.sec);render();}
+function videoTestSyncFolders(){const V=ST.videoTest;for(const m of V.models){if(!m.base_folder)m.base_folder=testSafeFolderName(m.folder||m.name);m.folder=testSafeFolderName(m.base_folder+(V.folder_suffix||''));}}
+function videoTestRename(i){const V=ST.videoTest,m=V.models[i];if(!m)return;if(m.renaming){const e=$('#vtf'+i);m.base_folder=testSafeFolderName(e?e.value:m.base_folder||m.name);m.custom_name=true;m.renaming=false;videoTestSyncFolders();render();return;}m.renaming=true;render();setTimeout(()=>{const e=$('#vtf'+i);if(e){e.focus();e.select()}},0);}
+function videoTestApplySuffix(kind){const V=ST.videoTest,id=kind==='folder'?'#vtFolderSuffixInput':'#vtFileSuffixInput';const value=testSafeSuffix(($(id)||{}).value||'');if(!value){cAlert('先输入要应用的后缀');return;}if(kind==='folder'){V.folder_suffix=value;videoTestSyncFolders();}else V.file_suffix=value;render();}
+function videoTestRemoveSuffix(kind){const V=ST.videoTest;if(kind==='folder'){V.folder_suffix='';videoTestSyncFolders();}else V.file_suffix='';render();}
+function videoTestSetNames(){const V=ST.videoTest;V.models.forEach((m,i)=>{if(m.renaming){const e=$('#vtf'+i);m.base_folder=testSafeFolderName(e?e.value:m.base_folder||m.name);m.custom_name=true;m.renaming=false;}});videoTestSyncFolders();goStep(82);}
+function videoTestMode(mode){ST.videoTest.mode=mode;render();}
+function videoTestToggleRef(name,el){const V=ST.videoTest,i=V.refs.indexOf(name);if(i>=0)V.refs.splice(i,1);else V.refs.push(name);if(el)el.classList.toggle('sel',i<0);const c=$('#vtrefcount');if(c)c.textContent=V.refs.length;}
+function videoTestRefsNext(){const V=ST.videoTest;if(V.mode==='i2v'&&!V.refs.length){cAlert('图生视频至少选择一张垫图');return;}goStep(83);}
+function videoTestToggleArray(key,value,on){const a=ST.videoTest[key];const i=a.indexOf(value);if(on&&i<0)a.push(value);if(!on&&i>=0)a.splice(i,1);}
+function videoTestAddCustomSize(){const V=ST.videoTest;let w=Math.max(64,Math.min(1920,Math.floor(+$('#vtcw').value/16)*16));let h=Math.max(64,Math.min(1920,Math.floor(+$('#vtch').value/16)*16));V.custom={w,h};const k=w+'x'+h;if(!V.sizes.includes(k))V.sizes.push(k);render();}
+function videoTestParamsNext(){const V=ST.videoTest;if(!V.sizes.length||!V.durations.length||!V.fpses.length){cAlert('尺寸、时长、帧率都至少选一项');return;}V.copies=Math.max(1,Math.min(10,+($('#vtcopies')||{}).value||1));V.lora_ids=[...document.querySelectorAll('input[name="vtlora"]:checked')].map(x=>x.value);V.style_2d=!!($('#vt2d')||{}).checked;if(V.style_2d&&!V.lora_ids.includes('anime'))V.lora_ids.unshift('anime');V.lora=V.lora_ids[0]||'none';V.stg=!!($('#vtstg')||{}).checked;V.interpolate=!!($('#vtinterp')||{}).checked;V.native_audio=!!($('#vtnativeaudio')||{}).checked;V.variants=[];for(const s of V.sizes){const [w,h]=s.split('x').map(Number);for(const duration of V.durations)for(const fps of V.fpses)V.variants.push({w,h,duration,fps});}if(V.variants.length>100){cAlert('参数组合超过100组，请少选一些尺寸、时长或帧率');return;}goStep(84);}
+function videoTestPromptsNext(){const V=ST.videoTest;V.prompts=($('#vtprompts')||{}).value||'';if(!V.prompts.split('\n').some(x=>x.trim())){cAlert('至少写一行提示词');return;}goStep(85);}
+async function videoTestGo(){const V=ST.videoTest;const body={models:V.models,mode:V.mode,refs:V.refs,variants:V.variants,copies:V.copies,lora:(V.lora_ids[0]||'none'),loras:V.lora_ids,stg:V.stg,interpolate:V.interpolate,native_audio:V.native_audio,style_2d:!!V.style_2d,folder_suffix:V.folder_suffix,file_suffix:V.file_suffix,prompts:V.prompts.split('\n').map(x=>x.trim()).filter(Boolean)};const r=await (await fetch('/api/video-test/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();if(r.ok){ST.step=86;render()}else cAlert((r.error_code==='test_worker_conflict'?'为了防止内存爆满，当前不能启动：':'创建失败：')+(r.error||'?'));}
+async function videoTestCtl(cmd){await fetch('/api/video-test/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd})});render();}
+async function videoTestResume(id){const r=await (await fetch('/api/video-test/resume',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})})).json();if(r.ok){cAlert('已加入视频队列，前面已完成的成片会自动跳过。','继续任务');render();}else cAlert('继续失败：'+(r.error||'?'));}
+async function videoTestRerun(id){if(!await cConfirm('按原配置重新跑视频任务 '+id+'？','重跑'))return;const r=await (await fetch('/api/video-test/rerun',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})})).json();if(r.ok)render();else cAlert('重跑失败：'+(r.error||'?'));}
+async function videoTestRerunEdit(id){const d=await j('/api/video-test/state');const t=(d.tasks||[]).find(x=>x.id===id);if(!t){cAlert('找不到视频任务 '+id);return;}const p=await j('/api/video-test/prompts?f='+encodeURIComponent(id));const V=videoTestDefault();V.models=(t.models||[]).map(m=>{const base=m.base_folder||m.folder||testSafeFolderName(m.name);return{...m,base_folder:base,folder:base,output_folder:'',custom_name:base!==testSafeFolderName(m.name)}});V.all=d.models||[];V.loras=d.loras||[];V.mode=t.mode||'i2v';V.refs=[...(t.refs||[])];V.variants=(t.variants||[]).map(v=>({...v}));V.sizes=[...new Set(V.variants.map(v=>v.w+'x'+v.h))];V.durations=[...new Set(V.variants.map(v=>v.duration))];V.fpses=[...new Set(V.variants.map(v=>v.fps))];V.copies=t.copies||1;V.lora_ids=[...(t.loras||((t.lora&&t.lora!=='none')?[t.lora]:[]))];V.style_2d=!!t.style_2d;if(V.style_2d&&!V.lora_ids.includes('anime'))V.lora_ids.unshift('anime');V.lora=V.lora_ids[0]||'none';V.stg=!!t.stg;V.interpolate=!!t.interpolate;V.native_audio=!!t.native_audio;V.folder_suffix=t.folder_suffix||'';V.file_suffix=t.file_suffix||'';V.prompts=p.text||'';ST.videoTest=V;ST.step=80;render();}
+async function videoTestDel(id){const r=await (await fetch('/api/video-test/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})})).json();if(!r.ok&&r.error)cAlert('删除失败：'+r.error);else render();}
+function videoTestEditPrompts(id){ST.videoTestEditId=id;ST.videoReturnStep=ST.step===89?89:70;goStep(87);}
+async function videoTestSavePrompts(){const text=($('#vtpe')||{}).value||'';await fetch('/api/video-test/prompts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:ST.videoTestEditId,text})});goStep(ST.videoReturnStep||89);}
 // ---- 气泡编辑器(可拖拽) ----
 function bubStage(){ return document.getElementById('bstage'); }
 function bubCur(){ return ((ST.bub&&ST.bub.list)||[]).find(x=>x.id===ST.bub.sel)||null; }
@@ -3583,6 +4958,75 @@ async function bubExport(){
   B.flat=r.url; render();
 }
 function pickModel(id,name,sec,kind){ ST.model=id; ST.mname=name; ST.msec=sec; ST.kind=kind; if(!ST.items.length) ST.items.push(newItem()); ST.step=3; render(); }
+function hqOpen(){
+  ST.hq=ST.hq||{session:'hq_'+Date.now(),model:'',faceSize:'1024x1024',count:1,bust:'natural',waist:'natural',hip:'natural',size:'832x1216',batchNo:0,variants:[],selected:-1};
+  ST.step=90; render();
+}
+function hqSlug(s){ return String(s||'').replace(/[^A-Za-z0-9_-]+/g,'_').replace(/^[_-]+|[_-]+$/g,'').slice(0,50)||'value'; }
+function hqStartFace(){
+  const h=ST.hq||{}; h.facePrompt=($('#hqfacep')||{}).value||h.facePrompt||''; h.neg=($('#hqneg')||{}).value||h.neg||NEG_DEF;
+  h.model=($('#hqmodel')||{}).value||h.model; h.faceSize=h.faceSize||'1024x1024';
+  const wh=h.faceSize.split('x');
+  if(!h.model){ cAlert('没有可用的 SDXL 单文件模型'); return; }
+  h.faceUrl=''; h.faceRef=''; h.faceDone=false; h.faceError=''; h.facePolling=false;
+  const name=h.session+'_face_'+Date.now();
+  j('/api/gen',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:h.model,pos:h.facePrompt,neg:h.neg,w:+wh[0],h:+wh[1],name,archive:h.session})}).then(r=>{
+    if(r.error){ h.faceError=r.error; render(); return; }
+    h.facePid=r.pid; ST.step=91; render();
+  }).catch(e=>{ h.faceError=String(e); render(); });
+  ST.step=91; render();
+}
+async function hqPollFace(){
+  const h=ST.hq; if(!h||!h.facePid||h.facePolling) return; h.facePolling=true;
+  while(ST.step===91 && !h.faceDone){
+    await new Promise(r=>setTimeout(r,1800));
+    let r; try{ r=await j('/api/poll?pid='+h.facePid); }catch(e){ continue; }
+    if(r.error){ h.faceError=r.error; h.facePolling=false; render(); return; }
+    if(r.done){ h.faceUrl=r.url; h.faceDone=true; h.facePolling=false; render(); return; }
+  }
+  h.facePolling=false;
+}
+async function hqAcceptFace(){
+  const h=ST.hq; if(!h||!h.faceUrl) return;
+  try{
+    const blob=await (await fetch(h.faceUrl)).blob();
+    h.faceRef=await uploadFile(new File([blob],'hq-face.png',{type:'image/png'}),'hq-face-'+h.session+'.png');
+    ST.step=92; render();
+  }catch(e){ cAlert('锁脸参考上传失败: '+e.message); }
+}
+async function hqStartVariants(){
+  const h=ST.hq; if(!h.faceRef){ cAlert('请先锁定脸部参考图'); return; }
+  h.bodyPrompt=(($('#hqbpos')||{}).value||'').trim(); h.bust=($('#hqbust')||{}).value||'natural'; h.waist=($('#hqwaist')||{}).value||'natural'; h.hip=($('#hqhip')||{}).value||'natural'; h.count=+(($('#hqcount')||{}).value||1); h.size=(($('#hqsize')||{}).value||'832x1216');
+  const bust={natural:'natural bust proportion',full:'fuller bust proportion',very_full:'very full bust proportion'}[h.bust];
+  const waist={natural:'natural waist',slim:'slim waist',very_slim:'defined slim waist'}[h.waist];
+  const hip={natural:'natural hip proportion',full:'fuller hips',very_full:'very full hips'}[h.hip];
+  const wh=h.size.split('x'); h.batchNo=(h.batchNo||0)+1; h.variants=[]; ST.step=93; render();
+  for(let i=0;i<h.count;i++){
+    const name=h.session+'_r'+h.batchNo+'_v'+(i+1)+'_bust-'+hqSlug(h.bust)+'_waist-'+hqSlug(h.waist)+'_hip-'+hqSlug(h.hip);
+    const pos='masterpiece, best quality, high resolution, photorealistic, neutral skin tone, balanced white balance, '+bust+', '+waist+', '+hip+', '+h.bodyPrompt;
+    const r=await j('/api/gen',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:h.model,pos,neg:h.neg,w:+wh[0],h:+wh[1],name,ipa:h.faceRef,ipa_weight:0.3,archive:h.session})});
+    const v={name,pid:r.pid||'',done:false,error:r.error||'',url:''}; h.variants.push(v); render();
+    if(r.error) break;
+  }
+  if(!h.variants.length) h.variants=[{name:'提交失败',done:false,error:'没有提交成功',url:''}];
+  h.variantPolling=false; render();
+}
+function hqPollVariants(){
+  const h=ST.hq; if(!h||h.variantPolling) return; h.variantPolling=true;
+  const tick=async()=>{
+    if(ST.step!==93){ h.variantPolling=false; return; }
+    let active=false;
+    for(const v of h.variants){
+      if(v.done||v.error||!v.pid) continue; active=true;
+      let r; try{ r=await j('/api/poll?pid='+v.pid); }catch(e){ continue; }
+      if(r.error) v.error=r.error; else if(r.done){ v.done=true; v.url=r.url; }
+    }
+    render();
+    if(active) setTimeout(tick,2000); else h.variantPolling=false;
+  };
+  tick();
+}
+function hqChoose(i){ const h=ST.hq; h.selected=i; render(); }
 function addCard(){ for(let i=0;i<ST.items.length;i++) collect(i); ST.items.push(newItem()); render(); }
 function delCard(i){ if(ST.items.length<=1){ cAlert('至少留一张'); return; } for(let j=0;j<ST.items.length;j++) collect(j); ST.items.splice(i,1); render(); }
 function collect(i){
@@ -4047,6 +5491,46 @@ setInterval(async()=>{
 </script></body></html>""".replace("%NEG%", json.dumps(NEG_DEFAULT)).replace("%VID%", str(VID_PORT))
 
 # ---------------- HTTP ----------------
+def video_tasks_snapshot():
+    """统一列出普通视频任务和磁盘成片；此函数只读，不会启动模型。"""
+    tasks = vidwf.list_tasks()
+    known_urls = {str(task.get("url") or "") for task in tasks if task.get("url")}
+    try:
+        files = [os.path.join(vidwf.OUT_VID, name) for name in os.listdir(vidwf.OUT_VID)
+                 if name.lower().endswith(".mp4")]
+    except OSError:
+        files = []
+    for path in sorted(files, key=lambda p: os.path.getmtime(p), reverse=True):
+        name = os.path.basename(path)
+        url = "/vout/" + urllib.parse.quote(name)
+        if url in known_urls:
+            continue
+        tasks.append({"id": "file:" + name, "engine": "file", "name": os.path.splitext(name)[0],
+                      "state": "done", "error": "", "url": url,
+                      "created": os.path.getmtime(path)})
+    order = {"running": 0, "queued": 1, "done": 2, "failed": 3}
+    tasks.sort(key=lambda t: (order.get(t.get("state"), 9), -float(t.get("created") or 0)))
+    return {"tasks": tasks}
+
+def _responses_parts(response):
+    """提取 GPT-OSS Responses API 的正文和推理摘要，兼容不同版本 schema。"""
+    answer, think = [], []
+    for item in response.get("output", []) or []:
+        typ = item.get("type")
+        parts = item.get("content") or item.get("summary") or []
+        if isinstance(parts, str):
+            parts = [{"text": parts}]
+        target = think if typ == "reasoning" else answer if typ in ("message", "output_text") else None
+        if target is None:
+            continue
+        for part in parts:
+            value = part if isinstance(part, str) else (part.get("text") or part.get("value") or "")
+            if value:
+                target.append(value)
+    if not answer and response.get("output_text"):
+        answer.append(str(response["output_text"]))
+    return "\n".join(answer).strip(), "\n".join(think).strip()
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def _qarg(self, key, default=""):
@@ -4086,8 +5570,12 @@ class H(BaseHTTPRequestHandler):
             self._send(200, json.dumps(svc.all_status()))
         elif self.path == "/api/vid/models":
             self._send(200, json.dumps({"unets": vidwf.list_unets(), "loras": vidwf.list_loras()}))
+        elif self.path == "/api/vid/tasks":
+            self._send(200, json.dumps(video_tasks_snapshot()))
         elif self.path == "/api/llm/models":
             self._send(200, json.dumps(llm.list_models()))
+        elif self.path == "/api/llm/metal/status":
+            self._send(200, json.dumps(llm.metal_status()))
         elif self.path == "/api/llm/current":
             self._send(200, json.dumps(llm.current()))
         elif self.path == "/api/llm/stats":
@@ -4134,6 +5622,11 @@ class H(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/test/prompts"):
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             self._send(200, json.dumps(test_prompts_get(q.get("f", [""])[0])))
+        elif self.path == "/api/video-test/state":
+            self._send(200, json.dumps(video_test_state()))
+        elif self.path.startswith("/api/video-test/prompts"):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            self._send(200, json.dumps(video_test_prompts_get(q.get("f", [""])[0])))
         elif self.path == "/api/refs":
             self._send(200, json.dumps(list_refs()))
         elif self.path.startswith("/refs/"):
@@ -4147,7 +5640,8 @@ class H(BaseHTTPRequestHandler):
                 with open(fp, "rb") as f: self._send(200, f.read(), "font/ttf")
             else: self._send(404, "{}")
         elif self.path.startswith("/api/vid/poll"):
-            self._send(200, json.dumps(vidwf.poll_vid(self._qarg("pid"))))
+            token = self._qarg("pid")
+            self._send(200, json.dumps(vidwf.poll_vid(token)))
         elif self.path.startswith("/api/svc/status"):
             t = self._qarg("type", "img")
             self._send(200, json.dumps(svc.svc_status(t)))
@@ -4185,13 +5679,22 @@ class H(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({"done": False, "error": "", "url": "",
                                             "state": state, "pos": pos, "run_elapsed": run_elapsed}))
         elif self.path.startswith("/out/"):
-            fp = os.path.join(OUT_DIR, os.path.basename(self.path[5:]))
+            # 图片地址允许带 ?t=时间防缓存,查询参数不能参与文件名匹配。
+            rel = self.path[5:].split("?", 1)[0]
+            fp = os.path.join(OUT_DIR, os.path.basename(urllib.parse.unquote(rel)))
             if os.path.exists(fp):
                 with open(fp, "rb") as f: self._send(200, f.read(), "image/png")
             else: self._send(404, "{}")
         elif self.path.startswith("/vout/"):
-            fp = os.path.join(vidwf.OUT_VID, os.path.basename(self.path[6:]))
+            rel = self.path[6:].split("?", 1)[0]
+            fp = os.path.join(vidwf.OUT_VID, os.path.basename(urllib.parse.unquote(rel)))
             if os.path.exists(fp):
+                with open(fp, "rb") as f: self._send(200, f.read(), "video/mp4")
+            else: self._send(404, "{}")
+        elif self.path.startswith("/vidtest/"):
+            rel = urllib.parse.unquote(self.path[len("/vidtest/"):].split("?", 1)[0]).lstrip("/")
+            fp = os.path.realpath(os.path.join(VTEST_OUT, rel))
+            if fp.startswith(os.path.realpath(VTEST_OUT) + os.sep) and os.path.isfile(fp):
                 with open(fp, "rb") as f: self._send(200, f.read(), "video/mp4")
             else: self._send(404, "{}")
         elif self.path.startswith("/comic_out/"):
@@ -4217,7 +5720,9 @@ class H(BaseHTTPRequestHandler):
                 d = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 pid = submit(d["model"], d["pos"], d["neg"], int(d["w"]), int(d["h"]), d["name"],
                              d.get("mode", "t2i"), d.get("ref"), d.get("mask"),
-                             float(d.get("strength", 0.6)), float(d.get("scale", 2.0)), d.get("ctype", "openpose"))
+                             float(d.get("strength", 0.6)), float(d.get("scale", 2.0)), d.get("ctype", "openpose"),
+                             d.get("ipa"), float(d.get("ipa_weight", 0.3)), int(d.get("batch", 1)),
+                             int(d.get("timeout", 1800)), d.get("archive"))
                 self._send(200, json.dumps({"pid": pid}))
             except Exception as e:
                 self._send(200, json.dumps({"error": str(e)}))
@@ -4253,25 +5758,82 @@ class H(BaseHTTPRequestHandler):
                 self._send(200, urllib.request.urlopen(req, timeout=120).read())
             except Exception as e:
                 self._send(200, json.dumps({"error": str(e)}))
+        elif self.path.startswith("/api/vid/audio"):
+            # 音频不上传给 ComfyUI,先落到本项目临时目录,生成结束后由 vidwf 用 ffmpeg 混入。
+            try:
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                if not body: raise ValueError("没有收到音频文件")
+                os.makedirs(vidwf.VID_AUDIO, exist_ok=True)
+                raw = os.path.basename(self._qarg("fname", "audio.bin"))
+                stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(raw)[0])[:80] or "audio"
+                ext = os.path.splitext(raw)[1].lower() or ".bin"
+                name = stem + "_" + str(int(time.time()*1000)) + ext
+                with open(os.path.join(vidwf.VID_AUDIO, name), "wb") as f: f.write(body)
+                self._send(200, json.dumps({"ok": True, "name": name}))
+            except Exception as e:
+                self._send(200, json.dumps({"error": str(e)}))
         elif self.path == "/api/vid/gen":
             try:
                 d = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                pid = vidwf.submit_vid(d["name"], unet_id=d["unet"], pos=d.get("pos", ""), neg=d.get("neg", ""),
-                                       image_name=d["image"], w=int(d["w"]), h=int(d["h"]),
-                                       frames=int(d["frames"]), fps=float(d.get("fps", 24)),
-                                       lora_id=d.get("lora", "none"), lora_strength=float(d.get("lora_strength", 0.8)),
-                                       use_stg=bool(d.get("stg", False)), steps=int(d.get("steps", 8)))
+                audio_name = os.path.basename(str(d.get("audio", "")))
+                audio_path = os.path.join(vidwf.VID_AUDIO, audio_name) if audio_name else ""
+                if audio_path and not os.path.isfile(audio_path):
+                    raise ValueError("找不到上传的音频文件")
+                service = svc.comfy_health("vid")
+                if not service.get("api_ok"):
+                    started = svc.start_svc("vid")
+                    if not started.get("ok"):
+                        raise ValueError(started.get("error", "生视频服务启动失败"))
+                    deadline = time.time() + 240
+                    while time.time() < deadline:
+                        if svc.comfy_health("vid", timeout=3).get("api_ok"):
+                            break
+                        time.sleep(3)
+                    else:
+                        raise ValueError("生视频服务启动后一直没有准备好")
+                common = dict(unet_id=d["unet"], pos=d.get("pos", ""), neg=d.get("neg", ""),
+                              image_name=d.get("image", ""), w=int(d["w"]), h=int(d["h"]),
+                              frames=int(d["frames"]), fps=float(d.get("fps", 24)),
+                              lora_id=d.get("lora", "none"), lora_strength=float(d.get("lora_strength", 0.8)),
+                              lora_ids=d.get("loras"), use_stg=bool(d.get("stg", False)),
+                              steps=int(d.get("steps", 8)), style_2d=bool(d.get("style_2d", False)),
+                              native_audio=bool(d.get("native_audio", False)))
+                post = {"interpolate": bool(d.get("interpolate", False)),
+                        "interpolate_fps": float(d.get("interpolate_fps", 0) or 0),
+                        "audio_path": audio_path, "native_audio": bool(d.get("native_audio", False))}
+                # 长片统一拆成均衡小段（例如 8 秒=4+4），模型不会一次计算过大的 latent。
+                if float(d.get("duration", 0) or 0) > 6.0:
+                    pid = vidwf.submit_long_vid(d["name"], float(d["duration"]), postprocess=post, **common)
+                else:
+                    pid = vidwf.submit_vid(d["name"], postprocess=post, **common)
                 self._send(200, json.dumps({"pid": pid}))
+            except Exception as e:
+                self._send(200, json.dumps({"error": str(e)}))
+        elif self.path == "/api/vid/cancel":
+            try:
+                d = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                token = str(d.get("pid", ""))
+                vidwf.cancel_vid(token)
+                self._send(200, json.dumps({"ok": True}))
             except Exception as e:
                 self._send(200, json.dumps({"error": str(e)}))
         elif self.path == "/api/llm/start":
             try:
                 d = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 r = llm.start_llm(d["id"], bool(d.get("thinking", True)),
-                                  float(d.get("temp", 0.7)), int(d.get("max_tokens", 16384)))
+                                  float(d.get("temp", 0.7)), int(d.get("max_tokens", 16384)),
+                                  bool(d.get("mtp", False)), bool(d.get("codex_proxy", False)),
+                                  int(d.get("ctx", 32768)), int(d.get("budget", -1)),
+                                  str(d.get("reasoning_level", "high")), int(d.get("parallel", 1)),
+                                  d.get("proxy_mode"))
                 self._send(200, json.dumps(r))
             except Exception as e:
                 self._send(200, json.dumps({"error": str(e)}))
+        elif self.path == "/api/llm/metal/init":
+            try:
+                self._send(200, json.dumps(llm.metal_init()))
+            except Exception as e:
+                self._send(200, json.dumps({"ok": False, "error": str(e)}))
         elif self.path == "/api/llm/pause":
             self._send(200, json.dumps(llm.pause_llm()))
         elif self.path == "/api/llm/resume":
@@ -4282,16 +5844,43 @@ class H(BaseHTTPRequestHandler):
             try:
                 d = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 port = int(load_config().get("llm_port", 8848))
-                body = json.dumps({"messages": d.get("messages", []),
-                                   "max_tokens": int(d.get("max_tokens", 2048)),
-                                   "temperature": float(d.get("temperature", 0.7))}).encode()
-                req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", data=body,
+                try:
+                    current = llm.current().get("model") or {}
+                except Exception:
+                    current = {}
+                is_metal = current.get("backend") == "metal"
+                is_vmlx = current.get("backend") == "vmlx"
+                if is_metal:
+                    # 官方 GPT-OSS 服务使用 Responses API；保持历史消息并将正文放入 input。
+                    body_obj = {"model": "gpt-oss-20b", "input": d.get("messages", []),
+                                "max_output_tokens": int(d.get("max_tokens", current.get("max_tokens", 2048))),
+                                "temperature": float(d.get("temperature", current.get("temp", 0.7))),
+                                "reasoning": {"effort": current.get("reasoning_level", "low")}}
+                    endpoint = "/v1/responses"
+                else:
+                    body_obj = {"messages": d.get("messages", []),
+                                "model": current.get("id") or "local-model",
+                                "max_tokens": int(d.get("max_tokens", current.get("max_tokens", 2048))),
+                                "temperature": float(d.get("temperature", current.get("temp", 0.7)))}
+                    if is_vmlx:
+                        # vMLX allows per-request overrides; the project console must
+                        # explicitly carry the launch-page thinking switch instead of
+                        # falling back to a client/library default.
+                        enabled = bool(current.get("thinking", False))
+                        body_obj["enable_thinking"] = enabled
+                        body_obj["chat_template_kwargs"] = {"enable_thinking": enabled}
+                    endpoint = "/v1/chat/completions"
+                body = json.dumps(body_obj).encode()
+                req = urllib.request.Request(f"http://127.0.0.1:{port}{endpoint}", data=body,
                                              headers={"Content-Type": "application/json"})
                 r = json.loads(urllib.request.urlopen(req, timeout=600).read())
-                msg = (r.get("choices") or [{}])[0].get("message") or {}
-                # 推理模型会把思考过程放 reasoning_content,正文在 content
-                reply = (msg.get("content") or "").strip()
-                think = (msg.get("reasoning_content") or "").strip()
+                if is_metal:
+                    reply, think = _responses_parts(r)
+                else:
+                    msg = (r.get("choices") or [{}])[0].get("message") or {}
+                    # 推理模型会把思考过程放 reasoning_content,正文在 content
+                    reply = (msg.get("content") or "").strip()
+                    think = (msg.get("reasoning_content") or "").strip()
                 self._send(200, json.dumps({"reply": reply, "think": think}))
             except Exception as e:
                 self._send(200, json.dumps({"error": str(e)}))
@@ -4459,6 +6048,42 @@ class H(BaseHTTPRequestHandler):
             try:
                 d = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 self._send(200, json.dumps(test_prompts_save(d.get("id", ""), d.get("text", ""))))
+            except Exception as e:
+                self._send(200, json.dumps({"error": str(e)}))
+        elif self.path == "/api/video-test/create":
+            try:
+                d = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                self._send(200, json.dumps(video_test_create(d)))
+            except Exception as e:
+                self._send(200, json.dumps({"error": str(e)}))
+        elif self.path == "/api/video-test/control":
+            try:
+                d = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                self._send(200, json.dumps(video_test_control(d.get("cmd", ""))))
+            except Exception as e:
+                self._send(200, json.dumps({"error": str(e)}))
+        elif self.path == "/api/video-test/resume":
+            try:
+                d = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                self._send(200, json.dumps(video_test_resume(d.get("id", ""))))
+            except Exception as e:
+                self._send(200, json.dumps({"error": str(e)}))
+        elif self.path == "/api/video-test/delete":
+            try:
+                d = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                self._send(200, json.dumps(video_test_delete(d.get("id", ""))))
+            except Exception as e:
+                self._send(200, json.dumps({"error": str(e)}))
+        elif self.path == "/api/video-test/rerun":
+            try:
+                d = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                self._send(200, json.dumps(video_test_rerun(d.get("id", ""))))
+            except Exception as e:
+                self._send(200, json.dumps({"error": str(e)}))
+        elif self.path == "/api/video-test/prompts":
+            try:
+                d = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                self._send(200, json.dumps(video_test_prompts_save(d.get("id", ""), d.get("text", ""))))
             except Exception as e:
                 self._send(200, json.dumps({"error": str(e)}))
         else:

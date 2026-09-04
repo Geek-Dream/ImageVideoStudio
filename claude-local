@@ -1,0 +1,50 @@
+#!/bin/zsh
+# Launch Claude Code against the local Qwen model through the shared 8848 proxy.
+set -e
+SCRIPT_PATH="$0"
+while [ -L "$SCRIPT_PATH" ]; do
+  LINK_TARGET="$(readlink "$SCRIPT_PATH")"
+  if [[ "$LINK_TARGET" = /* ]]; then
+    SCRIPT_PATH="$LINK_TARGET"
+  else
+    SCRIPT_PATH="$(dirname "$SCRIPT_PATH")/$LINK_TARGET"
+  fi
+done
+BASE="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+cd "$BASE"
+
+ENV_JSON="$(python3 -c 'import claude_local_config, json; print(json.dumps(claude_local_config.provider_environment(claude_local_config.find_local_qwen_provider()), ensure_ascii=False))')"
+eval "$(python3 -c 'import json, shlex, sys; data=json.loads(sys.argv[1]); print("\n".join("export %s=%s" % (k, shlex.quote(str(v))) for k,v in data.items()))' "$ENV_JSON")"
+
+python3 - "$BASE" "$ANTHROPIC_MODEL" <<'PY'
+import json, os, sys
+import llm
+
+base, requested_model = sys.argv[1], sys.argv[2]
+models = llm.list_models()
+target = requested_model.lower()
+chosen = None
+for model in models:
+    hay = " ".join(str(model.get(k, "")) for k in ("id", "name", "key", "gguf")).lower()
+    if target and target in hay and model.get("backend", "llama") == "llama":
+        chosen = model["id"]
+        break
+if chosen is None:
+    chosen = next((m["id"] for m in models if m.get("backend", "llama") == "llama" and m.get("exists")), None)
+if not chosen:
+    raise SystemExit("未找到可用的本地 llama.cpp Qwen 模型")
+prefs = next((m.get("prefs", {}) for m in models if m["id"] == chosen), {})
+result = llm.start_llm(chosen, bool(prefs.get("thinking", True)), float(prefs.get("temp", 0.4)),
+                       int(prefs.get("max_tokens", 16384)), bool(prefs.get("mtp", False)),
+                       False, int(prefs.get("ctx", 32768)), int(prefs.get("budget", -1)),
+                       str(prefs.get("reasoning_level", "high")), int(prefs.get("parallel", 1)), 2)
+if not result.get("ok"):
+    raise SystemExit(result.get("error", "本地 Claude 模型启动失败"))
+PY
+
+export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-http://127.0.0.1:8848}"
+export ANTHROPIC_AUTH_TOKEN="${ANTHROPIC_AUTH_TOKEN:-local-no-key}"
+# Ignore user-level settings (including CC Switch's 15721 endpoint). Project
+# and local settings remain available, while the exported local endpoint above
+# is authoritative for this launcher.
+exec claude --setting-sources project,local "$@"

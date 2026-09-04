@@ -28,6 +28,7 @@ CTRL_F   = os.path.join(JOBS, "control.json")
 PID_F    = os.path.join(JOBS, "worker.pid")
 OUT_BASE = os.path.join(BASE, "output", "imgtest")
 REFS     = os.path.join(BASE, "refs")
+VIDEO_PID_F = os.path.join(BASE, "video_test_jobs", "worker.pid")
 
 for d in (QUEUE, os.path.join(JOBS, "prompts"), OUT_BASE, REFS):
     os.makedirs(d, exist_ok=True)
@@ -36,6 +37,35 @@ for d in (QUEUE, os.path.join(JOBS, "prompts"), OUT_BASE, REFS):
 
 def _safe(s):
     return re.sub(r"[^\w.-]+", "_", s or "")
+
+
+def _safe_folder(raw, fallback):
+    """生成跨平台安全的目录名：只保留文字、数字和下划线。"""
+    for value in (raw, fallback, "model"):
+        name = re.sub(r"[^\w]+", "_", str(value or "").strip(), flags=re.UNICODE)
+        name = re.sub(r"_+", "_", name).strip("_")[:80].rstrip("_")
+        if name:
+            return name
+    return "model"
+
+
+def _other_worker_alive():
+    try:
+        pid = int(open(VIDEO_PID_F).read().strip())
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _result_state(stop, ok, fail):
+    if stop:
+        return "killed"
+    if ok and fail:
+        return "partial"
+    if ok:
+        return "done"
+    return "failed"
 
 def write_status(**kw):
     st = {}
@@ -133,18 +163,20 @@ def handle_control(task_path, t):
 
 # --------------- 单张生成(复刻 comic_gen.gen_one 的等待) ---------------
 
-def gen_wait(prompt, model_id, w, h, name, mode="t2i", ref=None, ipa=None, ipa_weight=0.3, batch=1):
+def gen_wait(prompt, model_id, w, h, name, mode="t2i", ref=None, ipa=None, ipa_weight=0.3,
+             batch=1, timeout=1800):
     """提交并等完成,返回 (文件路径列表, 秒数)。batch>1(仅t2i)一次出N张。"""
     if ipa:
         pid = genmod.submit(model_id, prompt, genmod.NEG_DEFAULT, w, h, name,
-                            ipa=ipa, ipa_weight=ipa_weight)
+                            ipa=ipa, ipa_weight=ipa_weight, timeout=timeout)
     elif ref:
         pid = genmod.submit(model_id, prompt, genmod.NEG_DEFAULT, w, h, name,
-                            "i2i", ref, None, 0.75)
+                            "i2i", ref, None, 0.75, timeout=timeout)
     else:
-        pid = genmod.submit(model_id, prompt, genmod.NEG_DEFAULT, w, h, name, batch=batch)
+        pid = genmod.submit(model_id, prompt, genmod.NEG_DEFAULT, w, h, name,
+                            batch=batch, timeout=timeout)
     t0 = time.time()
-    while time.time() - t0 < 1800:
+    while time.time() - t0 < timeout + 5:
         cmd = read_control()            # 等图期间也响应 kill_all(暂停不打断已提交的)
         if cmd == "kill_all":
             raise RuntimeError("KILL_ALL")
@@ -157,7 +189,7 @@ def gen_wait(prompt, model_id, w, h, name, mode="t2i", ref=None, ipa=None, ipa_w
         if t.get("error"):
             raise Exception(t["error"])
         time.sleep(1)
-    raise Exception("超时(30分钟)")
+    raise Exception(f"超时({max(1, round(timeout / 60))}分钟)")
 
 # --------------- 锁图: 先用选定模型 t2i 出一张脸,传 ComfyUI 当 IPA 参考 ---------------
 
@@ -207,17 +239,31 @@ def run_task(task_path, t):
     log(f"📋 任务 {t['id']}: {len(models)}模型 × {len(prompts)}提示词 × {per}张 = {total}张")
 
     stop = ""
+    service_error = ""
+    used_folders = set()
     for m in models:
         if stop:
             break
-        folder = _safe(m.get("folder") or m.get("name") or m["id"])
+        base_folder = _safe_folder(m.get("folder"), m.get("name") or m.get("id"))
+        folder_suffix = str(t.get("folder_suffix") or "")
+        file_suffix = str(t.get("file_suffix") or "")
+        if folder_suffix and not base_folder.endswith(folder_suffix):
+            base_folder = (base_folder[:max(1, 80 - len(folder_suffix))].rstrip("_") + folder_suffix)[:80]
+        folder = base_folder
+        suffix = 2
+        while folder.casefold() in used_folders:
+            tail = f"_{suffix}"
+            folder = base_folder[:80 - len(tail)].rstrip("_") + tail
+            suffix += 1
+        used_folders.add(folder.casefold())
         ddir = os.path.join(OUT_BASE, folder)
-        os.makedirs(ddir, exist_ok=True)
         for pi, ptext in enumerate(prompts, 1):
             if stop:
                 break
             # 纯 t2i(无垫图无锁脸)一批出 per 张(共享CLIP编码,省时);垫图/锁脸 submit 会钳回1,逐张
-            chunk = per if (not pad_server and not ipa_server) else 1
+            # submit() 为避免 32GB 机器爆内存会把 batch 钳到最多 4；这里也按 4 拆批，
+            # 否则用户选 6 张时只会实际得到 4 张，进度却错误地跳过余下 2 张。
+            chunk = min(per, 4) if (not pad_server and not ipa_server) else 1
             i = 1
             while i <= per:
                 if stop:
@@ -236,35 +282,65 @@ def run_task(task_path, t):
                 log(f"[{done+1}/{total}] {cur}" + (" [批量]" if n > 1 else ""))
                 name = _safe(f"test_{t['id']}_{m['id']}_p{pi}_{i}_{int(time.time())}")
                 try:
+                    # 慢模型（尤其 Flux）一次多图可能超过固定 30 分钟。按模型估时和
+                    # 本批张数留出 10 分钟装载/解码余量，避免仍在计算时被误判失败。
+                    timeout = max(1800, int(m.get("sec") or 0) * n + 600)
                     files, sec = gen_wait(ptext, m["id"], W, H, name,
-                                          ref=pad_server, ipa=ipa_server, batch=n)
+                                          ref=pad_server, ipa=ipa_server, batch=n,
+                                          timeout=timeout)
                     for k, f in enumerate(files):
-                        shutil.copy2(f, os.path.join(ddir, f"p{pi:02d}_{i+k}.png"))
+                        os.makedirs(ddir, exist_ok=True)
+                        shutil.copy2(f, os.path.join(ddir, f"p{pi:02d}_{i+k}{file_suffix}.png"))
                     ok += len(files)
                     log(f"  ✓ 完成{len(files)}张({int(sec)}秒) → output/imgtest/{folder}/p{pi:02d}_{i}" + (f"~{i+len(files)-1}.png" if len(files) > 1 else ".png"))
                     done += len(files)
-                except RuntimeError:
+                except RuntimeError as e:
+                    message = str(e)
+                    if message == "KILL_ALL":
+                        stop = "all"; break
+                    service_error = message
                     stop = "all"; break
                 except Exception as e:
+                    message = str(e)
                     fail += n; done += n
-                    log(f"  ✗ {e}")
+                    if "Connection refused" in message or "timed out" in message or "服务不可用" in message:
+                        service_error = message
+                        stop = "all"
+                    log(f"  ✗ {message}")
                 write_status(done=done, ok=ok, fail=fail)
                 i += n
             if stop:
                 break
 
-    t["state"] = "killed" if stop else "done"
+    if service_error:
+        t["state"] = "failed"
+    else:
+        t["state"] = _result_state(stop, ok, fail)
     t["finished"] = time.time()
+    t["ok"] = ok
+    t["fail"] = fail
+    t["total"] = total
+    if service_error:
+        t["error_code"] = "service_unavailable"
+        t["error"] = service_error
     save_task(task_path, t)
-    write_status(done=done, ok=ok, fail=fail)
-    log(f"{'⏹ 任务被杀' if stop else '🏁 任务结束'}: {t['id']} 成功 {ok}/{total}")
-    return stop
+    write_status(done=done, ok=ok, fail=fail, state=("error" if service_error else t["state"]),
+                 error_code="service_unavailable" if service_error else "",
+                 error=service_error, service_ready=not service_error, finished=True)
+    log(f"{'⏹ 任务被杀' if stop else '🏁 任务结束'}: {t['id']} 成功 {ok}/{total}，状态 {t['state']}")
+    return "error" if service_error else stop
 
 # --------------- 主循环: 队列跑空自动退出 ---------------
 
 def main():
     open(PID_F, "w").write(str(os.getpid()))
     clear_control()
+    if _other_worker_alive():
+        write_status(running=False, state="blocked", msg="视频测试正在运行，图片测试没有启动", finished=True)
+        log("✗ 视频测试 worker 正在运行，为保护内存，图片测试退出")
+        try: os.remove(PID_F)
+        except OSError: pass
+        return
     write_status(running=True, state="idle", msg="worker 启动", finished=False)
     log(f"🔧 测试场 worker 启动 pid={os.getpid()}")
     # 续跑: 上次被杀时正在 running 的任务拉回 queued,下次启动接着跑
@@ -281,29 +357,62 @@ def main():
             t["state"] = "queued"
             save_task(p, t)
             log(f"↩ 任务 {t.get('id')} 上次被中断,已重新排队")
-    if not cg.ensure_img_service():
-        write_status(running=False, state="error", msg="生图服务起不来", finished=True)
+    service = cg.ensure_img_service_ready()
+    if not service.get("ok"):
+        reason = service.get("error", "生图服务起不来")
+        log(f"✗ 生图服务不可用: {reason}")
+        for fn in sorted(os.listdir(QUEUE)):
+            if not fn.endswith(".json"):
+                continue
+            p = os.path.join(QUEUE, fn)
+            try:
+                t = load_task(p)
+            except Exception:
+                continue
+            if t.get("state") == "queued":
+                t.update(state="failed", finished=time.time(), error_code="service_unavailable", error=reason)
+                save_task(p, t)
+        write_status(running=False, state="error", msg="生图服务不可用", error_code="service_unavailable",
+                     error=reason, service_ready=False, finished=True)
+        try:
+            os.remove(PID_F)
+        except OSError:
+            pass
         return
-    stop_all = ""
+    write_status(service_ready=True, error_code="", error="")
+    stop_reason = ""
     while True:
         if read_control() == "kill_all":
-            stop_all = "all"; break
+            stop_reason = "killed"; break
         path, t = next_task()
         if not path:
             break                          # 队列空了 → 正常结束
         r = run_task(path, t)
         if r == "all":
-            stop_all = "all"; break
+            stop_reason = "killed"; break
+        if r == "error":
+            stop_reason = "error"; break
     try:
         os.remove(PID_F)
     except OSError:
         pass
-    if stop_all:
+    if stop_reason == "killed":
         write_status(running=False, state="killed", msg="已被杀死", finished=True)
         log("🛑 worker 被杀死")
+    elif stop_reason == "error":
+        write_status(running=False, state="error", msg="生图失败", finished=True)
+        log("🛑 worker 遇到服务级错误后退出")
     else:
-        write_status(running=False, state="done", msg="生图结束", finished=True)
-        log("🎉 生图结束(队列已空),worker 退出")
+        states = []
+        for fn in os.listdir(QUEUE):
+            if fn.endswith(".json"):
+                try:
+                    states.append(load_task(os.path.join(QUEUE, fn)).get("state"))
+                except Exception:
+                    continue
+        final_state = "error" if "failed" in states else ("partial" if "partial" in states else "done")
+        write_status(running=False, state=final_state, msg=("生图失败" if final_state == "error" else "生图结束"), finished=True)
+        log(f"🎉 生图结束(队列已空),worker 退出，状态 {final_state}")
 
 if __name__ == "__main__":
     main()
