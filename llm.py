@@ -190,6 +190,9 @@ def list_models():
         d = dict(m.get("defaults", {}))
         d.update(pr.get(m["key"], {}))           # 记忆覆盖默认
         d.setdefault("mtp", bool(m.get("has_mtp", False)))   # 有 MTP 头的模型默认开启加速
+        d.setdefault("eagle3", False)                         # Eagle3 默认关闭,由页面单独控制
+        d.setdefault("draft_simple", False)                   # 普通 0.6B draft 默认关闭
+        d.setdefault("draft_variant", "qwen3-0.6b-q8")       # 普通 draft 默认用实测最快的 0.6B
         d.setdefault("codex_proxy", False)                   # codex 工具兼容代理默认关(开源项目:别人可不开)
         d["proxy_mode"] = normalize_proxy_mode(d.get("proxy_mode", d.get("codex_proxy", False)))
         d.setdefault("supports_codex_proxy", bool(m.get("supports_codex_proxy", m.get("backend") not in ("metal", "vmlx"))))
@@ -221,11 +224,17 @@ def _find(model_id):
             return m
     return None
 
-def save_pref(key, thinking, temp, max_tokens, mtp=None, codex_proxy=None, ctx=None, budget=None, reasoning_level=None, parallel=1, proxy_mode=None):
+def save_pref(key, thinking, temp, max_tokens, mtp=None, codex_proxy=None, ctx=None, budget=None, reasoning_level=None, parallel=1, proxy_mode=None, eagle3=None, draft_simple=None, draft_variant=None):
     pr = _prefs()
     pr[key] = {"thinking": bool(thinking), "temp": float(temp), "max_tokens": int(max_tokens)}
     if mtp is not None:                          # 保留旧记录兼容;新记录带上 MTP 开关
         pr[key]["mtp"] = bool(mtp)
+    if eagle3 is not None:
+        pr[key]["eagle3"] = bool(eagle3)
+    if draft_simple is not None:
+        pr[key]["draft_simple"] = bool(draft_simple)
+    if draft_variant is not None:
+        pr[key]["draft_variant"] = str(draft_variant)
     if codex_proxy is not None:
         pr[key]["codex_proxy"] = bool(codex_proxy)
     if proxy_mode is not None:
@@ -279,7 +288,7 @@ def ensure_gpu_limit(need_mb):
             return {"ok": False, "cur": cur, "error": str(e), "manual": f"sudo {cmd}"}
 
 # ---------------- 启动参数(严格按 Qwen3 start.sh 骨架) ----------------
-def build_args(m, thinking, temp, max_tokens, mtp=False, codex_proxy=False, ctx=None, budget=-1, parallel=1):
+def build_args(m, thinking, temp, max_tokens, mtp=False, codex_proxy=False, ctx=None, budget=-1, parallel=1, eagle3=False, draft_simple=False, draft_variant=None):
     c = _cfg()
     # 上下文大小: 用户选的 ctx 优先, 没选用 config.json 的 llm_ctx, 再没有用 32K。
     if ctx is None:
@@ -309,9 +318,35 @@ def build_args(m, thinking, temp, max_tokens, mtp=False, codex_proxy=False, ctx=
             "--port", str(port),
             "--jinja",
             "--reasoning", reasoning]
+    # Qwen3-family templates default to thinking even when the reasoning
+    # parser is switched off. Pass the template flag explicitly so the UI's
+    # thinking toggle controls generation rather than only response parsing.
+    if m.get("is_reasoning"):
+        args += ["--chat-template-kwargs",
+                 json.dumps({"enable_thinking": bool(thinking)}, ensure_ascii=False)]
     if m.get("is_reasoning") and thinking and budget is not None and int(budget) >= 0:
         # 思考长度上限: 限制"想多久再答"; -1=不限(不加参数), 0=不想, N>0=最多N个思考token
         args += ["--reasoning-budget", str(int(budget))]
+    # Some models have a target-specific speculative decoder (for example
+    # EAGLE3).  It is enabled only when the configured draft file exists.
+    spec_type = str(m.get("spec_type", "")).strip()
+    spec_draft = m.get("spec_draft_model")
+    draft_path = m.get("draft_model")
+    for candidate in m.get("draft_models", []):
+        if candidate.get("id") == draft_variant:
+            draft_path = candidate.get("path")
+            break
+    if draft_simple and draft_path and os.path.exists(os.path.join(BASE, draft_path)):
+        args += ["--spec-type", "draft-simple", "--spec-draft-model", os.path.join(BASE, draft_path),
+                 "--spec-draft-n-max", str(int(m.get("draft_n_max", 3)))]
+    elif eagle3 and spec_type and spec_type != "draft-mtp" and spec_draft:
+        draft_path = os.path.join(BASE, spec_draft)
+        if os.path.exists(draft_path):
+            args += ["--spec-type", spec_type,
+                     "--spec-draft-model", draft_path,
+                     "--spec-draft-n-max", str(int(m.get("spec_draft_n_max", 4)))]
+            if m.get("spec_draft_p_min") is not None:
+                args += ["--spec-draft-p-min", str(float(m["spec_draft_p_min"]))]
     if mtp and m.get("has_mtp"):   # MTP 收益取决于模型、后端和接受率，不能假定一定提速
         args += ["--spec-type", "draft-mtp",
                  "--spec-draft-n-max", str(int(m.get("spec_draft_n_max", 3)))]
@@ -471,7 +506,7 @@ def _ensure_mac_status_item():
     except Exception:
         pass
 
-def start_llm(model_id, thinking, temp, max_tokens, mtp=False, codex_proxy=False, ctx=None, budget=-1, reasoning_level="high", parallel=1, proxy_mode=None):
+def start_llm(model_id, thinking, temp, max_tokens, mtp=False, codex_proxy=False, ctx=None, budget=-1, reasoning_level="high", parallel=1, proxy_mode=None, eagle3=False, draft_simple=False, draft_variant=None):
     """异步启动(加载 1-2 分钟,立即返回,前端轮询 /api/llm/current)。"""
     proxy_mode = normalize_proxy_mode(codex_proxy if proxy_mode is None else proxy_mode)
     codex_proxy = proxy_mode > 0
@@ -522,7 +557,7 @@ def start_llm(model_id, thinking, temp, max_tokens, mtp=False, codex_proxy=False
     service_port = backend_port if (is_vmlx and codex_proxy) else pub
     args = (_metal_args(m, max_tokens, temp, ctx, reasoning_level, thinking)
             if is_metal else (_vmlx_args(m, thinking, temp, max_tokens, mtp, ctx, service_port, parallel)
-                              if is_vmlx else build_args(m, thinking, temp, max_tokens, mtp, codex_proxy, ctx, budget, parallel)))
+                              if is_vmlx else build_args(m, thinking, temp, max_tokens, mtp, codex_proxy, ctx, budget, parallel, eagle3, draft_simple, draft_variant)))
     try:
         logf = open(svc.log_path("llm"), "ab")
         command = args if (is_metal or is_vmlx) else [binx] + args
@@ -553,7 +588,7 @@ def start_llm(model_id, thinking, temp, max_tokens, mtp=False, codex_proxy=False
                                          else f"找不到 {binx}(需 brew install llama.cpp)")}
     except Exception as e:
         return {"ok": False, "error": str(e)}
-    save_pref(m["key"], thinking, temp, max_tokens, mtp, proxy_mode == 1, ctx, budget, reasoning_level, parallel, proxy_mode)
+    save_pref(m["key"], thinking, temp, max_tokens, mtp, proxy_mode == 1, ctx, budget, reasoning_level, parallel, proxy_mode, eagle3, draft_simple, draft_variant)
     if m.get("is_reasoning"):
         _sync_dsh_reasoning(reasoning_level)   # 同步思考档位给 DSH(尽力而为)
     proxy_force = ({"thinking": bool(thinking), "temperature": float(temp),
@@ -570,6 +605,7 @@ def start_llm(model_id, thinking, temp, max_tokens, mtp=False, codex_proxy=False
                    "thinking": bool(thinking),
                    "temp": float(temp), "max_tokens": int(max_tokens),
                    "mtp": bool(mtp and m.get("has_mtp")),
+                   "eagle3": bool(eagle3), "draft_simple": bool(draft_simple), "draft_variant": str(draft_variant or "qwen3-0.6b-q8"),
                    "codex_proxy": bool(codex_proxy and proxy_pid),
                    "proxy_mode": int(proxy_mode if proxy_pid else 0),
                    "settings_proxy": bool(is_vmlx and proxy_pid),
@@ -725,7 +761,8 @@ def resume_llm():
                      bool(info.get("mtp", False)), bool(info.get("codex_proxy", False)),
                      int(info.get("ctx", 32768)), int(info.get("budget", -1)),
                      str(info.get("reasoning_level", "high")), int(info.get("parallel", 1)),
-                     int(info.get("proxy_mode", 1 if info.get("codex_proxy") else 0)))
+                     int(info.get("proxy_mode", 1 if info.get("codex_proxy") else 0)),
+                     bool(info.get("eagle3", False)), bool(info.get("draft_simple", False)), info.get("draft_variant"))
 
 def close_llm():
     """彻底关闭: 停进程 + 删掉状态记录(current_llm.json)。

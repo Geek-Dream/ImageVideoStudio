@@ -1,33 +1,6 @@
 {
   "models": [
     {
-      "id": "huihui-mtp",
-      "key": "HUIHUI_MTP",
-      "name": "Huihui-MTP",
-      "tag": "聊天/写作/无审查主力",
-      "desc": "Qwen3.6-35B-A3B + Claude-4.7-Opus 消融无审查 MTP 版，带视觉。实测 21 / 26 / 26.88 t/s；内存总占用约 31.18GB，电脑会明显卡顿，建议并行 1、温度 0.4~0.6。",
-      "speed_note": "实测 21 / 26 / 26.88 t/s；内存占用高，电脑会明显卡顿",
-      "recommended_temp": "0.4~0.6",
-      "author_source": "Huihui-Qwen3.6-35B-A3B-abliterated README + Qwen3.6 官方 README",
-      "author_usage": "作者未单独发布采样参数，按 Qwen3.6 官方建议：思考/通用 temperature 1.0、top_p 0.95、top_k 20；精确编码 temperature 0.6；非思考 temperature 0.7、top_p 0.8。默认思考模式，需显式关闭才能直答。",
-      "gguf": "models/llm/huihui-mtp-Q4_K.gguf",
-      "mmproj": "models/llm/aux/mmproj-huihui-f16.gguf",
-      "chat_template": null,
-      "is_reasoning": true,
-      "has_mtp": true,
-      "supports_codex_proxy": true,
-      "gpu_mb": 25600,
-      "defaults": {
-        "thinking": true,
-        "temp": 0.5,
-        "max_tokens": 16384,
-        "ctx": 32768,
-        "parallel": 1,
-        "mtp": true,
-        "codex_proxy": false
-      }
-    },
-    {
       "id": "qwen3.6-35b-a3b-hauhaucs-aggressive-iq4",
       "key": "QWEN36_35B_A3B_HAUHAUCS_AGGRESSIVE_IQ4",
       "name": "Qwen3.6-35B-A3B HauhauCS Aggressive · IQ4_XS",
@@ -78,6 +51,49 @@
         "ctx": 32768,
         "parallel": 1,
         "mtp": false,
+        "codex_proxy": false,
+        "budget": 2048,
+        "reasoning_level": "medium"
+      }
+    },
+    {
+      "id": "qwen3-14b-abliterated-q5-k-m",
+      "key": "QWEN3_14B_ABLITERATED_Q5_K_M",
+      "name": "Qwen3-14B Abliterated · Q5_K_M",
+      "tag": "无审查/聊天/编码",
+      "desc": "huihui-ai Qwen3-14B Abliterated Q5_K_M 量化版，无视觉投影，适合本地聊天、编码和连续排错。",
+      "speed_note": "约 9.8GB 主模型；Apple Silicon 14B 高速档",
+      "recommended_temp": "0.5~0.7",
+      "gguf": "models/llm/qwen3-14b-abliterated-Q5_K_M.gguf",
+      "mmproj": null,
+      "chat_template": null,
+      "is_reasoning": true,
+      "has_mtp": false,
+      "draft_model": "models/llm/aux/XuRay-Qwen3-0.8B-Q8_0.gguf",
+      "draft_n_max": 3,
+      "draft_models": [
+        {
+          "id": "xuray-qwen3-0.8b-q8",
+          "name": "XuRay Qwen3-0.8B Q8_0（最快，推荐）",
+          "path": "models/llm/aux/XuRay-Qwen3-0.8B-Q8_0.gguf"
+        },
+        {
+          "id": "qwen3-0.6b-q8",
+          "name": "Qwen3-0.6B Q8_0",
+          "path": "models/llm/aux/Qwen3-0.6B-Q8_0.gguf"
+        }
+      ],
+      "supports_codex_proxy": true,
+      "gpu_mb": 12288,
+      "defaults": {
+        "thinking": true,
+        "temp": 0.6,
+        "max_tokens": 8192,
+        "ctx": 32768,
+        "parallel": 1,
+        "mtp": false,
+        "draft_simple": true,
+        "draft_variant": "xuray-qwen3-0.8b-q8",
         "codex_proxy": false,
         "budget": 2048,
         "reasoning_level": "medium"

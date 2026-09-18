@@ -3163,7 +3163,7 @@ async function render(){
       </div>`).join('') + `<p><button class="back" onclick="home()">← 返回</button></p>`;
   }
   if(ST.step===21){
-    const m=ST.llmModel; const isMetal=m.backend==='metal'; const isVmlx=m.backend==='vmlx'; const p=m.prefs||{thinking:true,temp:0.7,max_tokens:8192,mtp:false,codex_proxy:false,proxy_mode:0,ctx:32768,parallel:1,budget:-1,reasoning_level:'high'};
+    const m=ST.llmModel; const isMetal=m.backend==='metal'; const isVmlx=m.backend==='vmlx'; const p=m.prefs||{thinking:true,temp:0.7,max_tokens:8192,mtp:false,eagle3:false,codex_proxy:false,proxy_mode:0,ctx:32768,parallel:1,budget:-1,reasoning_level:'high'};
     const proxyMode=Number.isInteger(+p.proxy_mode)?Math.max(0,Math.min(2,+p.proxy_mode)):(p.codex_proxy?1:0);
     const _b=p.budget??-1, _c=+p.ctx||32768, _ctxPresets=[16384,32768,65536], _customCtx=!_ctxPresets.includes(_c);
     const thinkHtml = m.is_reasoning
@@ -3198,11 +3198,12 @@ async function render(){
         </div>
       </div>`
       : `<div class="box"><b>🧠 思考设置</b><p class="small" style="margin:4px 0">此模型为快速应答型,无思考模式。</p></div>`;
-    const mtpLabel = m.mtp_warning ? 'MTP（实验性，不建议开启）' : 'MTP 加速（每步尝试预判多个 token）';
+    const mtpLabel = m.mtp_warning ? 'MTP（实验性，不建议开启）' : 'MTP 加速';
     const mtpHtml = !isMetal && m.has_mtp
-      ? `<div style="margin:6px 0"><label style="margin:0"><input type="checkbox" id="lmtp" ${p.mtp?'checked':''}> ${mtpLabel}</label>${m.mtp_warning?`<div class="small" style="color:#b54708;margin-top:5px">⚠ ${esc(m.mtp_warning)}</div>`:''}</div>`
+      ? `<div style="margin:6px 0"><label style="margin:0"><input type="checkbox" id="laccel" ${p.mtp?'checked':''}> ${mtpLabel}</label>${m.mtp_warning?`<div class="small" style="color:#b54708;margin-top:5px">⚠ ${esc(m.mtp_warning)}</div>`:''}</div>`
       : '';
     const mtpNoteHtml = m.mtp_compatible===false ? `<div class="small" style="color:#a15c00;margin:5px 0">MTP 暂不可用：${esc(m.mtp_note||'侧车与主模型词表不兼容')}。当前只启动主模型，避免加载失败。</div>` : '';
+    const draftHtml = m.id==='qwen3-14b-abliterated-q5-k-m' ? `<div style="margin:6px 0"><label style="margin:0"><input type="checkbox" id="laccel" ${p.draft_simple?'checked':''}> Draft 加速（固定 K=3）</label><select id="ldraftvariant" style="margin-left:8px">${(m.draft_models||[]).map(x=>`<option value="${x.id}" ${(p.draft_variant||'xuray-qwen3-0.8b-q8')===x.id?'selected':''}>${esc(x.name)}</option>`).join('')}</select></div>` : '';
     const cpxHtml = m.supports_codex_proxy ? `<div class="box" style="margin:4px 0"><label style="margin:0">代理模式</label><div class="proxy-switch" role="group" aria-label="代理模式"><button type="button" data-proxy-mode="0" class="${proxyMode===0?'active':''}" onclick="selectProxyMode(0)">关闭</button><button type="button" data-proxy-mode="1" class="${proxyMode===1?'active':''}" onclick="selectProxyMode(1)">Codex</button><button type="button" data-proxy-mode="2" class="${proxyMode===2?'active':''}" onclick="selectProxyMode(2)">Claude</button></div><input type="hidden" id="lcpx" value="${proxyMode}"><div id="lcpxMode" class="small">当前：${['关闭','Codex 代理','Claude 代理'][proxyMode]}</div><div class="small" style="margin-top:5px">${isVmlx?'普通 OpenAI 请求可直连 vMLX；选择代理后为工具请求增加格式适配，后端转到内部端口。':'Codex 使用 Responses API，Claude 使用 Anthropic Messages API，代理会把对应请求转换为 llama.cpp 接口。'} 公共地址固定使用 8848，同一时间只能运行一种代理。</div></div>` : '';
     const metalHint = isMetal ? `<div class="box"><b>官方 Metal 运行提示</b><div class="small" style="margin-top:5px">此模型走官方 GPT-OSS Responses API 和 Apple Metal 参考实现，不使用 llama.cpp/MTP/Codex 代理。需要先完成 Metal 初始化，并准备转换后的 model.bin。</div></div>` : '';
     const vmlxHint = isVmlx ? `<div class="box"><b>vMLX / MLX Metal</b><div class="small" style="margin-top:5px">此模型使用项目内隔离的 .venv-vmlx，实体读取 models/llm 下的 MXFP4 权重；与 llama.cpp/其他模型互斥运行。作者推荐 temperature 1.0、top_p 0.95、top_k 20；本机实测为稳定性优先，默认温度 0.4 且关闭原生 MTP。当前版本开启 MTP 后容易重复循环，稳定使用请保持关闭。</div></div>` : '';
@@ -3239,6 +3240,7 @@ async function render(){
       </div>
       <div class="box"><b>⚡ 加速与兼容</b>
         ${mtpHtml}
+        ${draftHtml}
         ${mtpNoteHtml}
         ${cpxHtml}
       </div>
@@ -4148,7 +4150,11 @@ async function llmStart(){
   const thinking=m.is_reasoning?($('#lthink')?$('#lthink').checked:!!m.prefs.thinking):false;
   const temp=+($('#ltemp')?$('#ltemp').value:m.prefs.temp);
   const max_tokens=Math.min(65536,Math.max(512,Math.round(+($('#lmax')?$('#lmax').value:m.prefs.max_tokens)||16384)));
-  const mtp=(m.backend==='metal'||!m.has_mtp)?false:(($('#lmtp')?$('#lmtp').checked:!!m.prefs.mtp));
+  const accel=$('#laccel')?$('#laccel').checked:false;
+  const mtp=(m.backend==='metal'||!m.has_mtp)?false:accel;
+  const eagle3=false;
+  const draft_simple=m.id==='qwen3-14b-abliterated-q5-k-m'?accel:false;
+  const draft_variant=$('#ldraftvariant')?$('#ldraftvariant').value:(m.prefs.draft_variant||'xuray-qwen3-0.8b-q8');
   const proxy_mode=(m.backend==='metal')?0:(($('#lcpx')?Math.max(0,Math.min(2,Math.round(+$('#lcpx').value||0))):Number.isInteger(+m.prefs.proxy_mode)?+m.prefs.proxy_mode:(m.prefs.codex_proxy?1:0)));
   const codex_proxy=proxy_mode===1;
   const csel=$('#lctx')?$('#lctx').value:String(m.prefs.ctx||32768);
@@ -4169,7 +4175,7 @@ async function llmStart(){
   const reasoning_level=m.is_reasoning?($('#llevel')?$('#llevel').value:(m.prefs.reasoning_level||'high')):'high';
   $('#app').innerHTML = `<div class="box">🚀 正在启动 ${esc(m.name)}…<br><span class="small">会先停掉其他服务腾内存;若 GPU 上限不足,会弹一次 macOS 密码框。</span><div class="bar" style="margin-top:12px"><i class="indet"></i></div></div>`;
   const d=await (await fetch('/api/llm/start',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({id:m.id,thinking,temp,max_tokens,mtp,codex_proxy,proxy_mode,ctx,parallel,budget,reasoning_level})})).json();
+    body:JSON.stringify({id:m.id,thinking,temp,max_tokens,mtp,eagle3,draft_simple,draft_variant,codex_proxy,proxy_mode,ctx,parallel,budget,reasoning_level})})).json();
   if(d.error){ let h=`<div class="box">启动失败:${esc(d.error)}</div>`;
     if(d.manual) h+=`<div class="box">可在终端手动运行(<code>!</code>前缀)后重试:<br><code>${esc(d.manual)}</code></div>`;
     h+=`<p><button onclick="goStep(21)">← 返回</button></p>`; $('#app').innerHTML=h; return; }
@@ -5825,7 +5831,7 @@ class H(BaseHTTPRequestHandler):
                                   bool(d.get("mtp", False)), bool(d.get("codex_proxy", False)),
                                   int(d.get("ctx", 32768)), int(d.get("budget", -1)),
                                   str(d.get("reasoning_level", "high")), int(d.get("parallel", 1)),
-                                  d.get("proxy_mode"))
+                                  d.get("proxy_mode"), bool(d.get("eagle3", False)), bool(d.get("draft_simple", False)), d.get("draft_variant"))
                 self._send(200, json.dumps(r))
             except Exception as e:
                 self._send(200, json.dumps({"error": str(e)}))
