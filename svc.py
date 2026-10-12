@@ -9,7 +9,7 @@
 #     (阻塞等 PID 消失 + 端口释放),否则 swap 双占拖死整机(教训见 PLAN.md)。
 # 依赖: 仅标准库。
 # ============================================================
-import json, os, signal, socket, subprocess, time, urllib.request
+import json, os, re, signal, socket, subprocess, time, urllib.request
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE, "config.json")
@@ -136,6 +136,8 @@ ivs:
   loras: image/loras
   ipadapter: image/ipadapter
   clip_vision: image/clip_vision
+  upscale_models: image/upscale_models
+  facerestore_models: image/facerestore
 ivs_video:
   base_path: {base}/models
   diffusion_models: video
@@ -202,7 +204,11 @@ def start_svc(stype):
         return {"ok": True, "already": True}
     stop_others(except_t=stype)          # 内存互斥:先把别的停死透
     if s["kind"] == "comfy":
-        return _launch_comfy(stype)
+        lock = ensure_mem_lock()         # 内存锁定开着→先把 GPU 上限抬到位再加载模型
+        r = _launch_comfy(stype)
+        if not lock.get("ok") and lock.get("error"):
+            r.setdefault("warnings", []).append(lock["error"])
+        return r
     # llm: 延迟 import,避免 P1 阶段 llm.py 未就绪时影响 img/vid
     try:
         import llm as _llm
@@ -304,3 +310,151 @@ def stop_all():
     for t in ("img", "vid", "llm"):
         stop_svc(t)
     return {"ok": True}
+
+# ---------------- GPU 内存锁定(系统级,重启自动还原) ----------------
+# 原理: Apple Silicon 的 iogpu.wired_limit_mb 决定 GPU/神经网络能有线占用的内存上限,
+# 用 sysctl 改它是系统级设置——本程序不开也保持生效,直到重启电脑。
+_GPU_LOCK_FAIL_AT = 0.0
+_GPU_LOCK_FAIL_COOLDOWN = 60.0
+
+def gpu_limit_mb():
+    try:
+        return int(subprocess.check_output(["sysctl", "-n", "iogpu.wired_limit_mb"],
+                                           stderr=subprocess.DEVNULL).strip())
+    except Exception:
+        return 0
+
+def total_mem_mb():
+    try:
+        return int(int(subprocess.check_output(["sysctl", "-n", "hw.memsize"],
+                                               stderr=subprocess.DEVNULL).strip()) / 1048576)
+    except Exception:
+        return 32768
+
+def used_mem_mb():
+    """系统当前真实占用(活动+wired+压缩器),给内存条的可视化用。"""
+    try:
+        out = subprocess.check_output(["vm_stat"], stderr=subprocess.DEVNULL, text=True)
+        pages = 0
+        for key in ("Pages active", "Pages wired down", "Pages occupied by compressor"):
+            m = re.search(re.escape(key) + r":\s+(\d+)", out)
+            if m:
+                pages += int(m.group(1))
+        return int(pages * 16384 / 1048576)
+    except Exception:
+        return 0
+
+def default_gpu_limit_mb():
+    """系统默认上限 ≈ 总内存 - 7GB(32GB 机器实测默认 25600)。"""
+    return max(4096, total_mem_mb() - 7168)
+
+def _sysctl_wired_limit(mb):
+    """osascript 弹一次管理员密码框执行 sysctl -w。成功返回 True。"""
+    global _GPU_LOCK_FAIL_AT
+    now = time.monotonic()
+    if now - _GPU_LOCK_FAIL_AT < _GPU_LOCK_FAIL_COOLDOWN:
+        return False
+    cmd = f"sysctl -w iogpu.wired_limit_mb={int(mb)}"
+    try:
+        r = subprocess.run(["osascript", "-e",
+                            f'do shell script "{cmd}" with administrator privileges'],
+                           capture_output=True, text=True, timeout=180)
+        if r.returncode == 0:
+            _GPU_LOCK_FAIL_AT = 0.0
+            return True
+        _GPU_LOCK_FAIL_AT = now
+        return False
+    except Exception:
+        _GPU_LOCK_FAIL_AT = now
+        return False
+
+def mem_lock_conf():
+    """当前内存锁定配置 + 系统实况(给网页展示)。"""
+    c = _cfg()
+    total = total_mem_mb()
+    return {"enabled": bool(c.get("mem_lock_enabled", False)),
+            "gb": int(c.get("mem_lock_gb", 25)),
+            "current_mb": gpu_limit_mb(),
+            "default_mb": default_gpu_limit_mb(),
+            "total_mb": total,
+            "used_mb": used_mem_mb(),
+            "img_running": svc_status("img")["running"],
+            "options_gb": [g for g in (5, 10, 15, 20, 25, 29, 32) if g <= max(8, (total - 3072) // 1024)]}
+
+def _save_mem_lock(enabled, gb):
+    try:
+        c = _cfg()
+        c["mem_lock_enabled"] = bool(enabled)
+        c["mem_lock_gb"] = int(gb)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(c, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+def set_mem_lock(enabled, gb, apply=True):
+    """开关切换: 开→立即把 GPU 上限抬到锁定值(只升不降,避免和语言模型的需求打架);
+    关→立即还原系统默认值。apply=False 时只保存档位偏好不做任何系统操作(预览用)。"""
+    gb = max(1, min(64, int(gb)))
+    if not apply:
+        _save_mem_lock(bool(enabled), gb)
+        return {"ok": True, "enabled": bool(enabled), "gb": gb, "current_mb": gpu_limit_mb(),
+                "error": None, "manual": None}
+    need_mb = gb * 1024
+    cur = gpu_limit_mb()
+    if enabled:
+        ok = cur >= need_mb or _sysctl_wired_limit(need_mb)
+        _save_mem_lock(True, gb)
+        return {"ok": ok, "enabled": True, "gb": gb, "current_mb": gpu_limit_mb(),
+                "error": None if ok else "需要管理员授权才能锁定,已取消或验证失败",
+                "manual": None if ok else f"sudo sysctl -w iogpu.wired_limit_mb={need_mb}"}
+    ok = cur <= default_gpu_limit_mb() or _sysctl_wired_limit(default_gpu_limit_mb())
+    _save_mem_lock(False, gb)
+    return {"ok": ok, "enabled": False, "gb": gb, "current_mb": gpu_limit_mb(),
+            "error": None if ok else "还原默认需要管理员授权,已取消或验证失败",
+            "manual": None if ok else f"sudo sysctl -w iogpu.wired_limit_mb={default_gpu_limit_mb()}"}
+
+def ensure_mem_lock():
+    """启动大模型服务前调用: 开关开着就把 GPU 上限抬到锁定值(只升不降)。"""
+    c = mem_lock_conf()
+    if not c["enabled"]:
+        return {"ok": True, "skipped": True}
+    need_mb = c["gb"] * 1024
+    if c["current_mb"] >= need_mb:
+        return {"ok": True, "skipped": True}
+    ok = _sysctl_wired_limit(need_mb)
+    return {"ok": ok, "current_mb": gpu_limit_mb(),
+            "error": None if ok else "内存锁定需要管理员授权,已取消(模型仍可启动,但可能交换变慢)",
+            "manual": None if ok else f"sudo sysctl -w iogpu.wired_limit_mb={need_mb}"}
+
+def mem_free(apps=False):
+    """一键腾内存: 停掉项目内驻留的大模型服务(生图/生视频/语言),再可选退出编辑器。
+    浏览器绝不退出(控制台页面跑在浏览器里)。返回腾出了多少 MB。"""
+    before = used_mem_mb()
+    stopped = []
+    try:
+        stop_all()
+        stopped.append("项目服务(生图/生视频/语言)")
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["pkill", "-f", "llama-server"], capture_output=True, timeout=10)
+        if r.returncode == 0:
+            stopped.append("llama-server")
+    except Exception:
+        pass
+    if apps:
+        # 注意: 绝不能退浏览器——控制台页面就跑在浏览器里,退了页面就没了。
+        # 只退编辑器类应用(浏览器请用户自己手动关)。
+        for app in ("Visual Studio Code",):
+            try:
+                subprocess.run(["osascript", "-e",
+                                f'tell application "{app}" to quit'],
+                               capture_output=True, timeout=15)
+                stopped.append(app)
+            except Exception:
+                pass
+    time.sleep(3)
+    after = used_mem_mb()
+    return {"ok": True, "before_mb": before, "after_mb": after,
+            "freed_mb": max(0, before - after), "stopped": stopped}

@@ -25,6 +25,9 @@ MODELS_IMG = os.path.join(BASE, "models", "image")         # 图片模型放这�
 MODELS_CN  = os.path.join(MODELS_IMG, "controlnet")        # 图片辅助模型(ControlNet)放这里
 MODELS_IPA = os.path.join(MODELS_IMG, "ipadapter")         # IPAdapter 角色一致性模型放这里
 MODELS_CV  = os.path.join(MODELS_IMG, "clip_vision")       # CLIP 视觉编码器(IPAdapter 的眼睛)放这里
+MODELS_LORA= os.path.join(MODELS_IMG, "loras")             # 图片 LoRA/LyCORIS 统一目录(网页勾选启用)
+MODELS_UP  = os.path.join(MODELS_IMG, "upscale_models")    # 放大算法模型(Real-ESRGAN 等)放这里
+MODELS_FR  = os.path.join(MODELS_IMG, "facerestore")       # 脸部修复模型(GFPGAN/CodeFormer)放这里
 MODELS_VID = os.path.join(BASE, "models", "video")         # 视频模型放这里
 OUT_DIR    = os.path.join(BASE, "output", "images")        # 成品图(网页可直接看)
 HQ_OUT     = os.path.join(BASE, "output", "high_quality") # 高质量工作流归档
@@ -33,6 +36,62 @@ MODELS_JSON= os.path.join(BASE, "models.json")             # 已知模型的友�
 
 IMG_EXTS = (".safetensors", ".ckpt", ".pt", ".pth")  # 仅单文件 checkpoint;GGUF 需多文件配套,本工具不支持
 NEG_DEFAULT = "blurry, low quality, worst quality, watermark, text"
+
+# ---------------- 画风锁定(全局设置,普通生图与测试场共用) ----------------
+# 作用: 每次生图自动给正向提示词加强制画风指令,并在负面词里排除对立风格。
+# 建议区间(三选一):
+#   free      自由发挥——不干预,模型按自身倾向出图;适合画风本身很稳的模型(如 wai 动漫王)或无所谓风格时。
+#   realistic 写实·摄影——要真人照片感时选这个;会负面排除 anime/cartoon/illustration 等。
+#   anime     动漫·插画——要二次元时选这个;会负面排除 photorealistic/photo 等。
+# 注意: Qwen-Image-2.1 官方推荐 CFG 4.0(区间 3.5~5)。CFG 过低(如 1.0)时文本约束力不足,
+#       即使选了写实也容易出动漫脸;切换本设置后如风格仍不明显,先检查模型预设的 CFG。
+STYLE_PRESETS = {
+    "free":      {"label": "自由发挥(不干预)",
+                   "pos": "",
+                   "neg": ""},
+    "realistic": {"label": "写实·摄影(真人照片感)",
+                   "pos": "写实摄影风格，photorealistic photograph, raw photo, natural skin texture, professional photography, ",
+                   "neg": "anime, cartoon, comic, illustration, painting, drawing, 3d render, cgi"},
+    "anime":     {"label": "动漫·插画(二次元)",
+                   "pos": "精致动漫插画风格，anime illustration, detailed 2d anime art, cel shading, ",
+                   "neg": "photorealistic, photograph, realistic, live action, 3d render, cgi"},
+}
+STYLE_NOTE = ("作用：每次生图自动给提示词加强制画风指令，并在负面词里排除对立风格；普通生图和 ⚙️测试场 共用，改一处全部生效。"
+              "建议：真人照片感选「写实·摄影」，二次元选「动漫·插画」，模型本身画风很稳或不挑风格时选「自由发挥」。"
+              "提醒：Qwen-Image-2.1 建议 CFG 3.5~5（官方 4.0），CFG 太低时画风指令约束力不足。"
+              "另：无审查（Heretic）编码器本身偏动漫审美，选「自由发挥」时提示词里带『真人』二字画风最稳。")
+
+def style_conf():
+    cur = str(CFG.get("style", "free"))
+    if cur not in STYLE_PRESETS:
+        cur = "free"
+    return {"style": cur,
+            "presets": [{"id": k, "label": v["label"]} for k, v in STYLE_PRESETS.items()],
+            "note": STYLE_NOTE}
+
+def set_style(sid):
+    global CFG
+    if sid not in STYLE_PRESETS:
+        return {"ok": False, "error": f"未知画风: {sid}(可选: {', '.join(STYLE_PRESETS)})"}
+    CFG["style"] = sid
+    save_config(CFG)
+    return {"ok": True, "style": sid}
+
+# ---------------- 构图预设(提示词前缀,所有玩法可叠加) ----------------
+# 构图不是模型功能,是"镜头语言"提示词: 选了就自动拼到正向最前面。
+# 与姿势控制可串联(构图管镜头远近,骨架管人物动作);与图像编辑/扩图/修复不叠加(那些玩法画面已由原图决定)。
+COMP_PRESETS = {
+    "":        ("默认(不指定镜头)", ""),
+    "closeup": ("特写(脸部为主)", "close-up shot, face focus, detailed facial features, "),
+    "upper":   ("半身像(腰以上)", "upper body shot, cowboy shot, "),
+    "full":    ("全身像(头到脚)", "full body shot, head to toe, "),
+    "wide":    ("远景·大场景", "wide shot, establishing shot, vast scenery, "),
+    "topdown": ("俯视(从上往下拍)", "from above, high angle, bird's eye view, "),
+    "lookup":  ("仰视(从下往上拍)", "from below, low angle, looking up, "),
+    "dutch":   ("倾斜角(动感构图)", "dutch angle, dynamic composition, "),
+    "side":    ("侧面像", "side view, profile, "),
+    "back":    ("背影(从身后拍)", "from behind, back view, "),
+}
 
 # ---------------- 配置读写 ----------------
 def default_config():
@@ -44,6 +103,9 @@ def default_config():
         "llm_port": 8848,       # 语言模型 llama-server 端口
         "llm_bin": "llama-server",  # llama-server 可执行文件名(PATH 里找)
         "llm_ctx": 32768,       # 语言模型上下文长度
+        "mem_lock_enabled": False,  # GPU 内存锁定开关(系统级,重启自动还原)
+        "mem_lock_gb": 25,          # 锁定时给 GPU/大模型划分的内存(GB)
+        "style": "free",            # 画风锁定: free自由发挥 / realistic写实摄影 / anime动漫插画(见 STYLE_PRESETS 备注)
         # GPT-OSS Metal 独立环境(源码、虚拟环境、权重均在项目 metal/ 下)
         "metal_repo": "metal/gpt-oss",
         "metal_venv": "metal/.venv",
@@ -83,6 +145,8 @@ def find_comfy():
 
 CFG = load_config()
 IMG_PORT, VID_PORT, SELF_PORT = CFG["img_port"], CFG["vid_port"], CFG["port"]
+for _d in (MODELS_LORA, MODELS_UP, MODELS_FR):   # 可选模块目录: 首次运行自动建好
+    os.makedirs(_d, exist_ok=True)
 
 # ---------------- 模型扫描 ----------------
 DIFF_DIR = os.path.join(MODELS_IMG, "diffusion")   # GGUF 主模型(unet)放这里
@@ -127,6 +191,34 @@ def match_note(*texts):
             return n
     return None
 
+_NOTE_MEM_RE = re.compile(r"(\d+)\s*[Gg][Bb]?\b")
+
+def note_mem_gb(note):
+    """从说明书条目里提取数字峰值(GB): mem_gb 字段优先,其次解析 mem 文本如 '约8GB'。"""
+    if not note:
+        return None
+    try:
+        if note.get("mem_gb"):
+            return max(1, int(note["mem_gb"]))
+    except Exception:
+        pass
+    m = _NOTE_MEM_RE.search(str(note.get("mem", "")))
+    return int(m.group(1)) if m else None
+
+def file_size_gb(*paths):
+    """一批模型文件的磁盘占用(GB,向上取整),用于没有说明书时的峰值估计。"""
+    total = 0
+    for p in paths:
+        try:
+            total += os.path.getsize(p)
+        except Exception:
+            pass
+    return int(total / 1e9 + 0.999)
+
+def est_peak_gb(weights_gb):
+    """峰值≈权重+1.5GB 运行开销(KV/激活/VAE缓冲),向上取整。"""
+    return int(weights_gb + 1.5 + 0.999)
+
 def gguf_ok(e):
     """GGUF 模型三件套(unet/编码器/vae)都在才算可用。"""
     try:
@@ -150,12 +242,15 @@ def list_models():
     if sd35_ok():
         meta = friendly.get(SD35_FILE, {})
         m = {"id": SD35_FILE, "kind": "sd3", "name": meta.get("name", "SD3.5 Medium"),
-             "sec": int(meta.get("sec", 180)),
+             "sec": int(meta.get("sec", 180)), "turbo": False, "sdxl_clip": False,
              "desc": meta.get("desc", "SD3.5 Medium 专用流·三编码器·文生图/图生图")}
         note = match_note(SD35_FILE, m["name"])
-        if note: m.update({"field": note.get("field"), "speed": note.get("speed"),
-                           "time": note.get("time"), "mem": note.get("mem"),
-                           "detail": note.get("detail")})
+        if note:
+            for k in ("field", "speed", "time", "mem", "detail"):
+                if note.get(k) is not None: m[k] = note[k]
+        m["mem_gb"] = note_mem_gb(note) or est_peak_gb(
+            file_size_gb(os.path.join(DIFF_DIR, SD35_FILE), *[(os.path.join(ENC_DIR, c)) for c in SD35_CLIPS],
+                         os.path.join(VAE_DIR, SD35_VAE)))
         out.append(m)
     if os.path.isdir(MODELS_IMG):
         for fn in sorted(os.listdir(MODELS_IMG)):
@@ -164,23 +259,30 @@ def list_models():
                 meta = friendly.get(fn, {})
                 m = {"id": fn, "kind": "checkpoint",
                      "name": meta.get("name", fn),
-                     "sec": int(meta.get("sec", 60)),
+                     "sec": int(meta.get("sec", 60)), "turbo": False, "sdxl_clip": True,
                      "desc": meta.get("desc", "单文件模型(checkpoint)")}
                 note = match_note(fn, m["name"])
-                if note: m.update({"field": note.get("field"), "speed": note.get("speed"),
-                                   "time": note.get("time"), "mem": note.get("mem"),
-                                   "detail": note.get("detail")})
+                if note:
+                    for k in ("field", "speed", "time", "mem", "detail"):
+                        if note.get(k) is not None: m[k] = note[k]
+                m["mem_gb"] = note_mem_gb(note) or est_peak_gb(file_size_gb(fp))
                 out.append(m)
     for e in ggufs:
         if gguf_ok(e):
             m = {"id": e["id"], "kind": "gguf", "hq_lock": bool(e.get("clip_type") == "sdxl"),
+                 "q21": bool(e.get("qwen21")), "turbo": bool(e.get("turbo")),
+                 "sdxl_clip": bool(e.get("clip_type") == "sdxl"),
                  "name": e.get("name", e["id"]),
                  "sec": int(e.get("sec", 120)),
                  "desc": e.get("desc", "GGUF 模型")}
+            if e.get("mem"): m["mem"] = e["mem"]
             note = match_note(e["id"], m["name"], e.get("unet", ""))
-            if note: m.update({"field": note.get("field"), "speed": note.get("speed"),
-                               "time": note.get("time"), "mem": note.get("mem"),
-                               "detail": note.get("detail")})
+            if note:
+                for k in ("field", "speed", "time", "mem", "detail"):
+                    if note.get(k) is not None: m[k] = note[k]
+            m["mem_gb"] = e.get("mem_gb") or note_mem_gb(note) or est_peak_gb(file_size_gb(
+                os.path.join(DIFF_DIR, e["unet"]), os.path.join(ENC_DIR, e["clip"]),
+                os.path.join(VAE_DIR, e["vae"])))
             out.append(m)
     return out
 
@@ -228,6 +330,125 @@ def first_clipvision():
             return f
     return ""
 
+# ---------------- 可选功能模块扫描(LoRA/放大/修脸/FaceID) ----------------
+def _scan_dir(d, exts):
+    try:
+        return sorted(f for f in os.listdir(d)
+                      if os.path.isfile(os.path.join(d, f)) and f.lower().endswith(exts))
+    except OSError:
+        return []
+
+# LoRA 大白话说明 + 搭配建议(按文件名匹配,新文件没登记就归到"其他")
+LORA_META = {
+  # ---- 通用增强 ----
+  "Detail_Tweaker_XL.safetensors":        {"cat":"通用增强","desc":"细节增减器。权重调正=细节更多更锐利,调负=画面更柔和简洁,是万金油补丁。","pair":"万能搭配:任何风格补丁后面挂它提质感,和动漫、写实、恐怖都不冲突。"},
+  "KoreanDollLikeness_SDXL.safetensors":  {"cat":"通用增强","desc":"韩式娃娃脸,把真人脸往精致偶像脸方向拉,只对人像起效。","pair":"配写实人像+锁脸功能;别和动漫风补丁一起开,画风会打架。"},
+  "Qwen_Boreal_Realistic_v2.safetensors": {"cat":"通用增强","desc":"Qwen 专用写实化补丁,去掉 AI 塑料感,皮肤头发更像照片。","pair":"只配 Qwen 模型;Qwen 出真人照片时勾它。"},
+  # ---- 风格画风 ----
+  "SamDoesArt_Style_XL.safetensors":      {"cat":"风格画风","desc":"Sam Yang 厚涂插画风,网红画师那种干净亮晶晶的人物肖像。","pair":"配人物肖像/半身像;不要再叠其他画风补丁,两种画风会互相稀释。"},
+  "PonyStyle_Smooth_Anime.safetensors":   {"cat":"风格画风","desc":"顺滑动漫风,线条干净、平涂上色,偏日常番剧感。","pair":"配 Pony 底模出二次元;想要更细致就再叠 Detail_Tweaker。"},
+  "PonyStyle_ConceptArt_Twilight.safetensors":{"cat":"风格画风","desc":"暮光概念艺术风,电影感光影,黄昏暖色调。","pair":"配 Pony 底模出大场景/氛围图;和哥特系叠可变暗黑黄昏。"},
+  "GachaSplash_Style_Pony.safetensors":   {"cat":"风格画风","desc":"扭蛋水花风,角色背后液体飞溅的动感特效,手游立绘既视感。","pair":"配 Pony 底模+战斗/元气场景;叠 Detail_Tweaker 水花更锐利。"},
+  # ---- 黑暗·哥特·恐怖 ----
+  "Gothic_Girl_v2_Pony.safetensors":      {"cat":"黑暗哥特","desc":"哥特少女:黑裙、苍白皮肤、暗黑妆容,黑暗系人像的核心补丁。","pair":"配 Witch_Cos 出哥特魔女;配 Yandere_Trance 出黑暗病娇;底模用 Pony/SDXL 系。"},
+  "Goth_Emo_Girl_Flux.safetensors":       {"cat":"黑暗哥特","desc":"哥特/情绪风女孩,烟熏妆+暗黑穿搭,文件小只有 19MB。","pair":"只配 Flux 模型;和 Flux_Klein_NSFW 是同底模搭档。"},
+  "Sweet_Lolita_XL.safetensors":          {"cat":"黑暗哥特","desc":"洛丽塔裙装(偏甜系),蕾丝蓬蓬裙。","pair":"想变哥特洛丽塔就叠 Gothic_Girl;单开是甜美系。SDXL 系通用。"},
+  "Eldritch_Comics_v1.2_SDXL.safetensors":{"cat":"黑暗哥特","desc":"克苏鲁恐怖漫画风:触手、旧日支配者、暗黑线条,美式恐怖漫画质感。","pair":"配 Realistic_Horror 恐怖加倍;配 Gothic_Girl 出暗黑漫画女主。SDXL 写实模型上效果最好。"},
+  "Realistic_Horror_SDXL.safetensors":    {"cat":"黑暗哥特","desc":"写实恐怖:血腥、阴暗、怪物感,往恐怖片海报方向拉。","pair":"配 Eldritch_Comics 出恐怖漫画;配 Horror_Skeletons 出亡灵场景。"},
+  "Horror_Skeletons_SDXL.safetensors":    {"cat":"黑暗哥特","desc":"骷髅/亡灵元素,给画面加骨骼、骸骨氛围。","pair":"配 Blood_Magic 出献祭/死灵法师场景;配 Realistic_Horror 恐怖升级。"},
+  "Blood_Magic_V2_Illustrious.safetensors":{"cat":"黑暗哥特","desc":"血魔法特效:血液、魔法阵、暗红光影,Illustrious/NoobAI 专用。","pair":"配 Witch_Cos 出施法魔女;配 Horror_Skeletons 出血祭场景;底模用 wai/NoobAI 系。"},
+  "Blood_Magic_MagicPACK_Pony.safetensors":{"cat":"黑暗哥特","desc":"Pony 版血魔法包,和上面同题材但配 Pony 底模。","pair":"Pony 底模时用这条代替 V2;同样配 Witch_Cos/骷髅系。"},
+  "Witch_Cos_XL.safetensors":             {"cat":"黑暗哥特","desc":"魔女服装:尖帽、斗篷、魔法道具,只换衣服不换脸。","pair":"配 Blood_Magic 出正在施法的魔女;配 Gothic_Girl 出黑暗魔女。"},
+  "Yandere_Trance_PonyXL.safetensors":    {"cat":"黑暗哥特","desc":"病娇恍惚表情+姿势,眼神空洞/崩坏笑那种感觉。","pair":"配 Gothic_Girl 出黑暗病娇;配 Realistic_Horror 出崩坏恐怖。"},
+  "Furry_Babes_Pony_Illu.safetensors":    {"cat":"黑暗哥特","desc":"兽耳娘/furry 角色,兽耳+尾巴+毛发质感,Pony 和 Illustrious 底模都能用。","pair":"想要黑暗 furry 就叠 Gothic_Girl 或 Horror 系;单开是普通兽耳娘。"},
+  # ---- 成人向(本地自用) ----
+  "NSFW_Filter_Slider_Illu.safetensors":  {"cat":"成人向","desc":"成人程度滑杆:权重拉高画面更露骨,拉负反而更保守,相当于总开关。","pair":"配任意成人向补丁当「程度调节器」用;Illustrious 底模。"},
+  "NSFW_Better_Ahegao_Illu.safetensors":  {"cat":"成人向","desc":"高潮脸表情补丁,神态刻画专用。","pair":"配任意成人姿势补丁(如 StandingSplit/ThighSex)一起用。"},
+  "NSFW_MultipleViews_Sex_Illu.safetensors":{"cat":"成人向","desc":"多视角成人构图,一张图里多个角度。","pair":"配 NSFW_Filter_Slider 控制程度;Illustrious 底模。"},
+  "NSFW_ThighSex_Illu.safetensors":       {"cat":"成人向","desc":"成人姿势(腿部),Pony/Illustrious 通用。","pair":"配 Better_Ahegao 表情补丁;别同时叠多个姿势补丁,骨架会乱。"},
+  "NSFW_DeepThroat_Illu.safetensors":     {"cat":"成人向","desc":"成人姿势(口部特写向),Illustrious 底模。","pair":"配 Better_Ahegao;一次只开一个姿势类补丁。"},
+  "NSFW_StandingSplit_SexPos_Illu.safetensors":{"cat":"成人向","desc":"成人姿势(站立一字马),Pony/Illustrious 通用。","pair":"配 Filter_Slider 调程度;一次只开一个姿势类补丁。"},
+  "NSFW_Bukkake_Cum_Illu.safetensors":    {"cat":"成人向","desc":"体液效果补丁(成人),Pony/Illustrious 通用。","pair":"配任意成人姿势补丁;和 Filter_Slider 叠可强可弱。"},
+  "NSFW_Nursing_Handjob_Pony.safetensors":{"cat":"成人向","desc":"成人手部动作姿势,Pony 底模专用。","pair":"配 Pony 底模;一次只开一个姿势类补丁。"},
+  "Flux_Klein_NSFW_v2.safetensors":       {"cat":"成人向","desc":"FLUX.2 Klein 9B 专用成人内容补丁(训练 8000 步),给该底模补上生成成人内容的能力。","pair":"⚠️ 只认 FLUX.2 Klein 底模:项目里现在的 Flux 是 FLUX.1 schnell,不匹配,勾了大概率没效果甚至崩图。真要用于 FLUX.2 Klein 时,可叠 Goth_Emo_Girl_Flux 出黑暗成人风。"},
+}
+LORA_CAT_ORDER = ["通用增强","风格画风","黑暗哥特","成人向","其他"]
+
+def list_loras():
+    """图片 LoRA/LyCORIS 统一目录(models/image/loras)清单。
+    enabled 持久化在 config.json 的 loras_disabled(黑名单)里,重启后保持勾选状态。"""
+    disabled = set(CFG.get("loras_disabled", []))
+    out = []
+    for f in _scan_dir(MODELS_LORA, IMG_EXTS):
+        try:
+            mb = round(os.path.getsize(os.path.join(MODELS_LORA, f)) / 1e6, 1)
+        except OSError:
+            mb = 0
+        meta = LORA_META.get(f, {})
+        out.append({"name": f, "size_mb": mb, "enabled": f not in disabled,
+                    "cat": meta.get("cat", "其他"),
+                    "desc": meta.get("desc", ""),
+                    "pair": meta.get("pair", "")})
+    order = {c: i for i, c in enumerate(LORA_CAT_ORDER)}
+    out.sort(key=lambda x: (order.get(x["cat"], 99), x["name"]))
+    return out
+
+def set_loras_disabled(names):
+    """保存 LoRA 勾选状态(黑名单制: 新放进目录的文件默认启用)。"""
+    CFG["loras_disabled"] = [os.path.basename(str(n)) for n in names if n]
+    save_config(CFG)
+    return {"ok": True, "disabled": CFG["loras_disabled"]}
+
+def list_upscale_models():
+    """放大算法模型(Real-ESRGAN/SwinIR 等 .pth/.safetensors)。"""
+    return _scan_dir(MODELS_UP, (".pth", ".safetensors", ".pt"))
+
+def list_facerestore():
+    """脸部修复模型: 项目 models/image/facerestore/ 与 ComfyUI 自带 facerestore_models/ 都算。"""
+    files = _scan_dir(MODELS_FR, (".pth", ".safetensors", ".pt"))
+    cd = CFG.get("comfy_dir", "")
+    if cd:
+        for f in _scan_dir(os.path.join(cd, "models", "facerestore_models"), (".pth", ".safetensors", ".pt")):
+            if f not in files:
+                files.append(f)
+    return files
+
+def first_facerestore():
+    fs = list_facerestore()
+    for f in fs:                       # 优先 GFPGAN(动漫/真人通用,速度也快)
+        if "gfpgan" in f.lower():
+            return f
+    return fs[0] if fs else ""
+
+def faceid_status():
+    """FaceID(锁五官·高级)就绪检查。返回 (ready, [缺什么+放哪])。"""
+    missing = []
+    cd = CFG.get("comfy_dir", "")
+    ins_dir = os.path.join(cd, "models", "insightface") if cd else ""
+    if not (ins_dir and os.path.isdir(ins_dir) and os.listdir(ins_dir)):
+        missing.append("insightface 人脸分析包(下载 buffalo_l.zip 解压到 ComfyUI/models/insightface/)")
+    if not any("faceid" in f.lower() for f in _scan_dir(MODELS_IPA, (".safetensors", ".bin"))):
+        missing.append("FaceID 适配器(ip-adapter-faceid-plusv2_sdxl.bin 放 models/image/ipadapter/)")
+    if not any("faceid" in f.lower() for f in _scan_dir(MODELS_LORA, IMG_EXTS)):
+        missing.append("FaceID LoRA(ip-adapter-faceid-plusv2_sdxl_lora.safetensors 放 models/image/loras/)")
+    return (not missing, missing)
+
+def capabilities():
+    """前端据此决定哪些功能可勾选/置灰。一次返回全部可选模块状态。"""
+    fid_ok, fid_missing = faceid_status()
+    return {
+        "has_cn": has_controlnet(),
+        "has_ipa": bool(first_ipa() and first_clipvision()),
+        "faceid_ready": fid_ok,
+        "faceid_missing": fid_missing,
+        "facefix_models": list_facerestore(),
+        "upscale_models": list_upscale_models(),
+        "loras": list_loras(),
+        "lora_dir": MODELS_LORA,
+        "upscale_dir": MODELS_UP,
+        "facerestore_dir": MODELS_FR,
+    }
+
 # ---------------- ComfyUI 工作流(checkpoint / GGUF 双架构) ----------------
 def _enc_nodes(e):
     """按模型架构返回 (加载器节点dict, clip接线, vae接线, model接线)。"""
@@ -267,16 +488,77 @@ def _enc_nodes(e):
     return ({"1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": e["id"]}}},
             ["1", 1], ["1", 2], ["1", 0])
 
+def _add_facefix(wf, img_out, weight=0.5):
+    """在出图链路末尾串脸部修复(GFPGAN/CodeFormer, mtb 节点)。返回新的图像输出接线。
+    属于后处理: 出图后自动检测脸并单独重绘脸部, 治"脸崩"; 可与任何玩法叠加。"""
+    model = first_facerestore()
+    if not model:
+        raise ValueError("勾选了脸部修复,但没找到修复模型: 把 GFPGANv1.4.pth(或 CodeFormer)放进 models/image/facerestore/ 后重启生图服务")
+    wf["fx1"] = {"class_type": "Load Face Enhance Model (mtb)", "inputs": {"model_name": model, "upscale": 1}}
+    wf["fx2"] = {"class_type": "Restore Face (mtb)", "inputs": {
+        "image": img_out, "model": ["fx1", 0], "aligned": False,
+        "only_center_face": False, "weight": float(weight), "save_tmp_steps": False}}
+    return ["fx2", 0]
+
 def build_wf(e, pos, neg, w, h, seed, mode="t2i", ref=None, mask=None,
-             strength=0.6, scale=2.0, ctype="openpose", ipa=None, ipa_weight=0.3, batch=1):
-    """e 是 find_entry() 返回的模型定义。五种玩法: t2i/i2i/inpaint/upscale/pose。
+             strength=0.6, scale=2.0, ctype="openpose", ipa=None, ipa_weight=0.3, batch=1, opts=None):
+    """e 是 find_entry() 返回的模型定义。玩法: t2i/i2i/inpaint/upscale/pose/edit/outpaint/restore。
     ipa=参考人物图(服务端文件名)时,叠加 IPAdapter 角色一致性(可与其他玩法组合)。
     ipa_weight 控制锁脸力度(本机 M1 Max/MPS 实测): 配大头照参考图,0.3 干净且锁脸最稳,
-    0.35 仍可用, >=0.4 会出排线/彩虹色边杂纹。参考图务必用大头照/半身照,全身照锁不住脸。"""
+    0.35 仍可用, >=0.4 会出排线/彩虹色边杂纹。参考图务必用大头照/半身照,全身照锁不住脸。
+    opts 为可选功能字典: composition(构图) / loras([{name,strength}]) / fast(加速) /
+    faceid(高级锁五官) / ipa_end(锁脸生效终点) / facefix(出图后脸部修复) /
+    pose_strict(严格按骨架) / mask_grow,mask_blur,mask_invert(重绘遮罩处理) /
+    pad({l,t,r,b}, outpaint 用) / upscale_model(restore 用算法放大)。"""
+    opts = opts or {}
     loaders, clip_src, vae_src, model_src = _enc_nodes(e)
-    cfg = e.get("sampler", SAMPLER_DEFAULT)
+    cfg = dict(e.get("sampler", SAMPLER_DEFAULT))
     wf = dict(loaders)
-    if e["kind"] == "sd3":
+    comp = COMP_PRESETS.get(str(opts.get("composition", "")), ("", ""))[1]
+    if comp:
+        pos = comp + pos                       # 构图=镜头语言提示词,拼到最前面
+    if opts.get("fast") and not e.get("turbo"):
+        # ⚡加速: 步数砍到约55%,速度快近一倍;细节/稳定性略降(前端勾选时已告知影响)
+        cfg["steps"] = max(6, int(round(int(cfg.get("steps", 20)) * 0.55)))
+    # LoRA/LyCORIS 叠加(最多3个,按勾选顺序串): checkpoint 连 CLIP 一起调,GGUF 只接 unet
+    loras = [l for l in (opts.get("loras") or []) if isinstance(l, dict) and l.get("name")][:3]
+    if loras:
+        if e["kind"] == "sd3":
+            raise ValueError("SD3.5 Medium 暂不支持 LoRA 叠加,请换单文件/GGUF 模型")
+        for li, lo in enumerate(loras):
+            lname = os.path.basename(str(lo["name"]))
+            try:
+                lstrength = max(0.0, min(2.0, float(lo.get("strength", 0.8))))
+            except (TypeError, ValueError):
+                lstrength = 0.8
+            if not os.path.exists(os.path.join(MODELS_LORA, lname)):
+                raise ValueError(f"LoRA 文件不在 models/image/loras/ 里: {lname}")
+            nid = f"2l{li}"
+            if e["kind"] == "checkpoint":
+                wf[nid] = {"class_type": "LoraLoader", "inputs": {
+                    "lora_name": lname, "strength_model": lstrength,
+                    "strength_clip": lstrength, "model": model_src, "clip": clip_src}}
+                clip_src = [nid, 1]
+            else:
+                wf[nid] = {"class_type": "LoraLoaderModelOnly", "inputs": {
+                    "lora_name": lname, "strength_model": lstrength, "model": model_src}}
+            model_src = [nid, 0]
+    st = STYLE_PRESETS.get(str(CFG.get("style", "free")))   # 画风锁定(全局设置)
+    if st:
+        if st["pos"]:
+            pos = st["pos"] + pos
+        if st["neg"]:
+            neg = (neg.rstrip(" ,，") + ", " + st["neg"]) if neg else st["neg"]
+    neg_out = ["4", 0]
+    pos_out = ["3", 0]
+    if e.get("qwen21"):
+        # 官方 all-in-one 编码: 正向/负向/参考图一次搞定, 输出尺寸跟随第一张参考图(纯文生图时 latent 不用它的)
+        wf["3q"] = {"class_type": "TextEncodeQwenImage21", "inputs": {
+            "clip": clip_src, "prompt": pos, "negative_prompt": neg,
+            "vae": vae_src, "resolution": 1024}}
+        pos_out = ["3q", 0]
+        neg_out = ["3q", 1]
+    elif e["kind"] == "sd3":
         wf["1s"] = {"class_type": "ModelSamplingSD3", "inputs": {"shift": 3.0, "model": model_src}}
         model_src = ["1s", 0]
         wf["3"] = {"class_type": "CLIPTextEncodeSD3", "inputs": {
@@ -286,7 +568,6 @@ def build_wf(e, pos, neg, w, h, seed, mode="t2i", ref=None, mask=None,
     else:
         wf["3"] = {"class_type": "CLIPTextEncode", "inputs": {"text": pos, "clip": clip_src}}
         wf["4"] = {"class_type": "CLIPTextEncode", "inputs": {"text": neg, "clip": clip_src}}
-    pos_out = ["3", 0]
     if e.get("flux_guidance"):  # flux 系正向要过 FluxGuidance
         wf["3g"] = {"class_type": "FluxGuidance", "inputs": {"guidance": 3.5, "conditioning": ["3", 0]}}
         pos_out = ["3g", 0]
@@ -294,38 +575,146 @@ def build_wf(e, pos, neg, w, h, seed, mode="t2i", ref=None, mask=None,
     if ipa:  # 角色一致性(IPAdapter): 参考人物的脸/形象经 CLIP 视觉编码后注入交叉注意力,只换 model 接线
         if not (e["kind"] == "checkpoint" or e.get("clip_type") == "sdxl"):
             raise ValueError("角色一致性(IPAdapter)需要 SDXL 模型")
-        ipam, cv = first_ipa(), first_clipvision()
-        if not ipam or not cv:
-            raise ValueError("未找到 IPAdapter 模型或 CLIP 视觉编码器,检查 models/image/ipadapter 和 clip_vision/")
-        wf["1c"] = {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": cv}}
-        wf["1i"] = {"class_type": "IPAdapterModelLoader", "inputs": {"ipadapter_file": ipam}}
-        wf["1l"] = {"class_type": "LoadImage", "inputs": {"image": ipa}}
-        wf["1a"] = {"class_type": "IPAdapterAdvanced", "inputs": {
-            "model": model_src, "ipadapter": ["1i", 0], "clip_vision": ["1c", 0], "image": ["1l", 0],
-            "weight": ipa_weight, "weight_type": "linear", "combine_embeds": "concat",
-            "start_at": 0.0, "end_at": 1.0, "embeds_scaling": "V only"}}
-        model_src = ["1a", 0]
+        try:
+            ipa_end = max(0.1, min(1.0, float(opts.get("ipa_end", 1.0) or 1.0)))
+        except (TypeError, ValueError):
+            ipa_end = 1.0
+        if opts.get("faceid"):
+            # 高级·锁五官(FaceID): 用 insightface 提取五官特征,换姿势/发型脸也不变;
+            # 比普通锁脸更准,但要多三个文件(缺哪个 faceid_status() 会列出)
+            fid_ok, fid_missing = faceid_status()
+            if not fid_ok:
+                raise ValueError("FaceID(高级锁五官)缺文件: " + "；".join(fid_missing))
+            wf["1u"] = {"class_type": "IPAdapterUnifiedLoaderFaceID", "inputs": {
+                "model": model_src, "preset": "FACEID PLUS V2",
+                "lora_strength": 0.6, "provider": "CoreML"}}
+            wf["1c"] = {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": first_clipvision()}}
+            wf["1l"] = {"class_type": "LoadImage", "inputs": {"image": ipa}}
+            wf["1a"] = {"class_type": "IPAdapterFaceID", "inputs": {
+                "model": ["1u", 0], "ipadapter": ["1u", 1], "clip_vision": ["1c", 0],
+                "image": ["1l", 0], "weight": ipa_weight, "weight_faceidv2": 1.0,
+                "weight_type": "linear", "combine_embeds": "concat",
+                "start_at": 0.0, "end_at": ipa_end, "embeds_scaling": "V only"}}
+            model_src = ["1a", 0]
+        else:
+            ipam, cv = first_ipa(), first_clipvision()
+            if not ipam or not cv:
+                raise ValueError("未找到 IPAdapter 模型或 CLIP 视觉编码器,检查 models/image/ipadapter 和 clip_vision/")
+            wf["1c"] = {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": cv}}
+            wf["1i"] = {"class_type": "IPAdapterModelLoader", "inputs": {"ipadapter_file": ipam}}
+            wf["1l"] = {"class_type": "LoadImage", "inputs": {"image": ipa}}
+            wf["1a"] = {"class_type": "IPAdapterAdvanced", "inputs": {
+                "model": model_src, "ipadapter": ["1i", 0], "clip_vision": ["1c", 0], "image": ["1l", 0],
+                "weight": ipa_weight, "weight_type": "linear", "combine_embeds": "concat",
+                "start_at": 0.0, "end_at": ipa_end, "embeds_scaling": "V only"}}
+            model_src = ["1a", 0]
+
+    if mode == "edit":  # Qwen-Image-2.1 原生图像编辑: 参考图走多模态编码进条件, 说哪改哪, 尺寸跟随参考图
+        if not e.get("qwen21"):
+            raise ValueError("原生图像编辑(说哪改哪)目前只有 Qwen-Image-2.1 支持")
+        if e.get("turbo"):
+            raise ValueError("极速(Turbo)版是6步蒸馏模型,暂不支持图像编辑,请选「高质量·无审查」版")
+        wf["6"] = {"class_type": "LoadImage", "inputs": {"image": ref}}
+        wf["3q"]["inputs"]["images"] = {"image_1": ["6", 0]}
+        # 前缀 KV 缓存(官方编辑工作流同款): 显存吃紧时自动挪内存, 几乎不掉速
+        wf["1k"] = {"class_type": "QwenImage21Cache", "inputs": {"model": model_src, "device": "auto", "dtype": "default"}}
+        wf["9"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": 1.0, "model": ["1k", 0], "positive": pos_out, "negative": neg_out, "latent_image": ["3q", 2]}}
+        wf["10"] = {"class_type": "VAEDecode", "inputs": {"samples": ["9", 0], "vae": vae_src}}
+        out_img = ["10", 0]
+        if opts.get("facefix"):
+            out_img = _add_facefix(wf, out_img, opts.get("facefix_weight", 0.5))
+        wf["11"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": "ivs", "images": out_img}}
+        return wf
 
     if mode == "inpaint":  # 局部重绘: 只重画涂抹区域
         if e["kind"] == "sd3":
             raise ValueError("SD3.5 Medium 当前只支持文生图和图生图，不支持局部重绘")
+        if e.get("qwen21"):
+            raise ValueError("Qwen-Image-2.1 请用「图像编辑(说哪改哪)」:直接上传原图+描述要改什么")
         wf["6"] = {"class_type": "LoadImage", "inputs": {"image": ref}}
         wf["7"] = {"class_type": "LoadImageMask", "inputs": {"image": mask, "channel": "red"}}
-        wf["8"] = {"class_type": "VAEEncodeForInpaint", "inputs": {"pixels": ["6", 0], "vae": vae_src, "mask": ["7", 0], "grow_mask_by": 6}}
-        wf["9"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": 1.0, "model": model_src, "positive": pos_out, "negative": ["4", 0], "latent_image": ["8", 0]}}
+        # 遮罩先扩边+羽化再进 VAE: 边缘过渡自然,不会留下一圈生硬接缝; grow_mask_by 归 0 交给这里管
+        try:
+            mgrow = int(opts.get("mask_grow", 6))
+            mblur = float(opts.get("mask_blur", 6))
+        except (TypeError, ValueError):
+            mgrow, mblur = 6, 6.0
+        wf["7g"] = {"class_type": "GrowMaskWithBlur", "inputs": {
+            "mask": ["7", 0], "expand": mgrow, "tapered_corners": True,
+            "flip_input": bool(opts.get("mask_invert", False)),
+            "blur_radius": mblur, "lerp_alpha": 1.0, "decay_factor": 1.0, "fill_holes": True}}
+        wf["8"] = {"class_type": "VAEEncodeForInpaint", "inputs": {"pixels": ["6", 0], "vae": vae_src, "mask": ["7g", 0], "grow_mask_by": 0}}
+        wf["9"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": 1.0, "model": model_src, "positive": pos_out, "negative": neg_out, "latent_image": ["8", 0]}}
         wf["10"] = {"class_type": "VAEDecode", "inputs": {"samples": ["9", 0], "vae": vae_src}}
-        wf["11"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": "ivs", "images": ["10", 0]}}
+        out_img = ["10", 0]
+        if opts.get("facefix"):
+            out_img = _add_facefix(wf, out_img, opts.get("facefix_weight", 0.5))
+        wf["11"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": "ivs", "images": out_img}}
         return wf
 
     if mode == "upscale":  # 放大: 先拉伸再低幅度重绘补细节
         if e["kind"] == "sd3":
             raise ValueError("SD3.5 Medium 当前只支持文生图和图生图，不支持放大重绘")
+        if e.get("qwen21"):
+            raise ValueError("Qwen-Image-2.1 暂不支持放大重绘,可先用文生图出大图(支持 2K)")
         wf["6"] = {"class_type": "LoadImage", "inputs": {"image": ref}}
         wf["7"] = {"class_type": "ImageScaleBy", "inputs": {"upscale_method": "lanczos", "scale_by": scale, "image": ["6", 0]}}
         wf["8"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["7", 0], "vae": vae_src}}
-        wf["9"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": strength, "model": model_src, "positive": pos_out, "negative": ["4", 0], "latent_image": ["8", 0]}}
+        wf["9"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": strength, "model": model_src, "positive": pos_out, "negative": neg_out, "latent_image": ["8", 0]}}
         wf["10"] = {"class_type": "VAEDecode", "inputs": {"samples": ["9", 0], "vae": vae_src}}
-        wf["11"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": "ivs", "images": ["10", 0]}}
+        out_img = ["10", 0]
+        if opts.get("facefix"):
+            out_img = _add_facefix(wf, out_img, opts.get("facefix_weight", 0.5))
+        wf["11"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": "ivs", "images": out_img}}
+        return wf
+
+    if mode == "outpaint":  # 扩图: 原图四周留白继续画,竖图变横图/小景变大景
+        if e["kind"] == "sd3":
+            raise ValueError("SD3.5 Medium 暂不支持扩图,请换单文件/GGUF 模型")
+        if e.get("qwen21"):
+            raise ValueError("Qwen-Image-2.1 请直接用「图像编辑(说哪改哪)」:上传原图并描述向外扩展,效果比扩图节点好")
+        pad = opts.get("pad") or {}
+        try:
+            pl, pt, pr, pb = (max(0, min(2048, int(pad.get(k, 0) or 0))) for k in ("l", "t", "r", "b"))
+        except (TypeError, ValueError):
+            raise ValueError("扩图参数格式不对")
+        if max(pl, pt, pr, pb) <= 0:
+            raise ValueError("扩图需要至少一个方向扩出像素(左/上/右/下 任填一个 >0)")
+        wf["6"] = {"class_type": "LoadImage", "inputs": {"image": ref}}
+        wf["7"] = {"class_type": "ImagePadForOutpaint", "inputs": {
+            "image": ["6", 0], "left": pl, "top": pt, "right": pr, "bottom": pb,
+            "feathering": int(opts.get("feather", 40) or 40)}}
+        wf["8"] = {"class_type": "VAEEncodeForInpaint", "inputs": {
+            "pixels": ["7", 0], "vae": vae_src, "mask": ["7", 1], "grow_mask_by": 8}}
+        wf["9"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": 1.0, "model": model_src, "positive": pos_out, "negative": neg_out, "latent_image": ["8", 0]}}
+        wf["10"] = {"class_type": "VAEDecode", "inputs": {"samples": ["9", 0], "vae": vae_src}}
+        out_img = ["10", 0]
+        if opts.get("facefix"):
+            out_img = _add_facefix(wf, out_img, opts.get("facefix_weight", 0.5))
+        wf["11"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": "ivs", "images": out_img}}
+        return wf
+
+    if mode == "restore":  # 画质增强/老照片修复: 放大 → 低幅度重绘补细节(可叠加脸部修复)
+        if e["kind"] == "sd3":
+            raise ValueError("SD3.5 Medium 暂不支持画质增强,请换单文件/GGUF 模型")
+        if e.get("qwen21"):
+            raise ValueError("Qwen-Image-2.1 请用「图像编辑(说哪改哪)」:上传老照片并描述『修复划痕噪点、增强清晰度、自然上色』")
+        wf["6"] = {"class_type": "LoadImage", "inputs": {"image": ref}}
+        upmodel = str(opts.get("upscale_model", "") or "")
+        if upmodel:  # 选了算法放大(Real-ESRGAN 等): 先算法放大,比直接拉伸细节好
+            if upmodel not in list_upscale_models():
+                raise ValueError(f"放大模型不在 models/image/upscale_models/ 里: {upmodel}")
+            wf["6u"] = {"class_type": "UpscaleModelLoader", "inputs": {"model_name": upmodel}}
+            wf["6s"] = {"class_type": "ImageUpscaleWithModel", "inputs": {"upscale_model": ["6u", 0], "image": ["6", 0]}}
+        else:
+            wf["6s"] = {"class_type": "ImageScaleBy", "inputs": {"upscale_method": "lanczos", "scale_by": scale, "image": ["6", 0]}}
+        wf["7"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["6s", 0], "vae": vae_src}}
+        wf["8"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": strength, "model": model_src, "positive": pos_out, "negative": neg_out, "latent_image": ["7", 0]}}
+        wf["9"] = {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": vae_src}}
+        out_img = ["9", 0]
+        if opts.get("facefix"):
+            out_img = _add_facefix(wf, out_img, opts.get("facefix_weight", 0.7))
+        wf["10"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": "ivs", "images": out_img}}
         return wf
 
     if mode == "pose":  # 姿势控制: 仅单文件 checkpoint(SDXL 系配 union controlnet)
@@ -334,33 +723,62 @@ def build_wf(e, pos, neg, w, h, seed, mode="t2i", ref=None, mask=None,
         cn = first_controlnet()
         if not cn:
             raise ValueError("未找到 ControlNet 辅助模型,请先放入 models/image/controlnet/")
+        # 严格模式: 全程满强度照骨架来; 关掉则用滑杆强度且后半程放手(构图更自由,可能不完全跟姿势)
+        strict = bool(opts.get("pose_strict", True))
+        cn_strength = 1.0 if strict else strength
+        cn_end = 1.0 if strict else 0.75
         wf["5"] = {"class_type": "EmptyLatentImage", "inputs": {"width": w, "height": h, "batch_size": 1}}
         wf["6"] = {"class_type": "LoadImage", "inputs": {"image": ref}}
         wf["7"] = {"class_type": "ControlNetLoader", "inputs": {"control_net_name": cn}}
         wf["8"] = {"class_type": "SetUnionControlNetType", "inputs": {"control_net": ["7", 0], "type": ctype}}
-        wf["9"] = {"class_type": "ControlNetApplyAdvanced", "inputs": {"positive": ["3", 0], "negative": ["4", 0], "control_net": ["8", 0], "image": ["6", 0], "strength": strength, "start_percent": 0.0, "end_percent": 1.0}}
+        wf["9"] = {"class_type": "ControlNetApplyAdvanced", "inputs": {"positive": ["3", 0], "negative": neg_out, "control_net": ["8", 0], "image": ["6", 0], "strength": cn_strength, "start_percent": 0.0, "end_percent": cn_end}}
         wf["10"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": 1.0, "model": model_src, "positive": ["9", 0], "negative": ["9", 1], "latent_image": ["5", 0]}}
         wf["11"] = {"class_type": "VAEDecode", "inputs": {"samples": ["10", 0], "vae": vae_src}}
-        wf["12"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": "ivs", "images": ["11", 0]}}
+        out_img = ["11", 0]
+        if opts.get("facefix"):
+            out_img = _add_facefix(wf, out_img, opts.get("facefix_weight", 0.5))
+        wf["12"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": "ivs", "images": out_img}}
         return wf
 
     if mode == "i2i" and ref:  # 以图生图: 参考图编码进 latent,按 strength 重绘
+        if e.get("qwen21"):
+            raise ValueError("Qwen-Image-2.1 不用以图生图:选「图像编辑(说哪改哪)」上传原图并描述改动,效果远好于重绘")
         wf["5"] = {"class_type": "LoadImage", "inputs": {"image": ref}}
         # 先把参考图等比缩放到目标 W×H(crop=center 铺满居中裁,不拉伸),
         # 否则 latent 尺寸=参考图尺寸,输出会无视请求的 W×H(构图被压成 ref 竖版半身)。
         wf["5b"] = {"class_type": "ImageScale", "inputs": {"upscale_method": "lanczos", "width": w, "height": h, "crop": "center", "image": ["5", 0]}}
         wf["6"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["5b", 0], "vae": vae_src}}
-        wf["7"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": strength, "model": model_src, "positive": pos_out, "negative": ["4", 0], "latent_image": ["6", 0]}}
+        wf["7"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": strength, "model": model_src, "positive": pos_out, "negative": neg_out, "latent_image": ["6", 0]}}
         wf["8"] = {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": vae_src}}
-        wf["9"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": "ivs", "images": ["8", 0]}}
+        out_img = ["8", 0]
+        if opts.get("facefix"):
+            out_img = _add_facefix(wf, out_img, opts.get("facefix_weight", 0.5))
+        wf["9"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": "ivs", "images": out_img}}
         return wf
 
     # t2i 普通文生图(batch>1: 同一提示词一次出N张不同seed,共享CLIP编码,省时间;仅本路径支持批量)
     wf["5"] = {"class_type": "EmptySD3LatentImage" if e["kind"] == "sd3" else e.get("latent", "EmptyLatentImage"),
                "inputs": {"width": w, "height": h, "batch_size": max(1, int(batch))}}
-    wf["6"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": 1.0, "model": model_src, "positive": pos_out, "negative": ["4", 0], "latent_image": ["5", 0]}}
+    if e.get("turbo"):
+        # Viggle 蒸馏6步: 固定sigma表(按分辨率自动shift) + cfg=1.0(无CFG无负面), 必须用这套, 普通KSampler会糊
+        wf["6s"] = {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}}
+        wf["6t"] = {"class_type": "ViggleTurboSigmas", "inputs": {"latent": ["5", 0],
+                   "nodes": "1.0, 0.9375, 0.875, 0.75, 0.5, 0.25"}}
+        wf["7"] = {"class_type": "SamplerCustom", "inputs": {"model": model_src, "add_noise": True,
+                   "noise_seed": seed, "cfg": 1.0, "positive": pos_out, "negative": neg_out,
+                   "sampler": ["6s", 0], "sigmas": ["6t", 0], "latent_image": ["5", 0]}}
+        wf["8"] = {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": vae_src}}
+        out_img = ["8", 0]
+        if opts.get("facefix"):
+            out_img = _add_facefix(wf, out_img, opts.get("facefix_weight", 0.5))
+        wf["9"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": "ivs", "images": out_img}}
+        return wf
+    wf["6"] = {"class_type": "KSampler", "inputs": {**cfg, "seed": seed, "denoise": 1.0, "model": model_src, "positive": pos_out, "negative": neg_out, "latent_image": ["5", 0]}}
     wf["7"] = {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": vae_src}}
-    wf["8"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": "ivs", "images": ["7", 0]}}
+    out_img = ["7", 0]
+    if opts.get("facefix"):
+        out_img = _add_facefix(wf, out_img, opts.get("facefix_weight", 0.5))
+    wf["8"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": "ivs", "images": out_img}}
     return wf
 
 # ---------------- ComfyUI 通信 ----------------
@@ -395,7 +813,7 @@ def _submit_prompt(req, retries=2):
     raise ComfyServiceUnavailable(f"生图服务 {IMG_PORT} 不可用: {last}") from last
 
 
-def submit(model, pos, neg, w, h, name, mode="t2i", ref=None, mask=None, strength=0.6, scale=2.0, ctype="openpose", ipa=None, ipa_weight=0.3, batch=1, timeout=1800, archive=None):
+def submit(model, pos, neg, w, h, name, mode="t2i", ref=None, mask=None, strength=0.6, scale=2.0, ctype="openpose", ipa=None, ipa_weight=0.3, batch=1, timeout=1800, archive=None, opts=None):
     import random
     e = find_entry(model)
     if not e:
@@ -404,7 +822,7 @@ def submit(model, pos, neg, w, h, name, mode="t2i", ref=None, mask=None, strengt
     batch = max(1, min(4, int(batch)))          # 钳 1~4: 32GB内存,SDXL batch>4 易 swap 反而更慢
     if mode != "t2i":
         batch = 1                                # 批量只走 t2i;i2i/垫图/inpaint 等 latent 来自参考图,保持逐张
-    wf = build_wf(e, pos, neg, w, h, seed, mode, ref, mask, strength, scale, ctype, ipa, ipa_weight, batch)
+    wf = build_wf(e, pos, neg, w, h, seed, mode, ref, mask, strength, scale, ctype, ipa, ipa_weight, batch, opts)
     req = urllib.request.Request(f"http://127.0.0.1:{IMG_PORT}/prompt",
                                  data=json.dumps({"prompt": wf}).encode(),
                                  headers={"Content-Type": "application/json"})
@@ -471,6 +889,65 @@ def wait_done(pid):
             return
     timeout_min = max(1, round(TASKS.get(pid, {}).get("timeout", 1800) / 60))
     with LOCK: TASKS[pid]["error"] = f"超时({timeout_min}分钟)"
+
+def _recover_collect(pid):
+    """按 pid 从 ComfyUI 历史里收产物: 拷到 output/images/rec_<pid8>.png 并删临时文件。
+    返回 url; 没产物返回 None。幂等: 已收过直接返回。"""
+    dest = os.path.join(OUT_DIR, f"rec_{pid[:8]}.png")
+    if os.path.exists(dest):
+        return "/out/" + os.path.basename(dest)
+    try:
+        hist = comfy_get(f"/history/{pid}")
+    except Exception:
+        return None
+    h = hist.get(pid)
+    if not h:
+        return None
+    st = h.get("status", {})
+    if not st.get("completed") or st.get("status_str") == "error":
+        return None
+    srcs = []
+    for out in h.get("outputs", {}).values():
+        for img in out.get("images", []):
+            f = os.path.join(COMFY_OUT, img.get("subfolder", ""), img["filename"])
+            if os.path.exists(f):
+                srcs.append(f)
+    if not srcs:
+        return None
+    os.makedirs(OUT_DIR, exist_ok=True)
+    shutil.copy2(srcs[-1], dest)
+    for f in srcs:
+        try: os.remove(f)
+        except OSError: pass
+    return "/out/" + os.path.basename(dest)
+
+def _poll_recover(pid):
+    """控制台重启后 TASKS 丢失的兜底: 直接问 ComfyUI。
+    还在队列→返回进度; 已完成→收集产物返回 done; 失败/取消→返回 error; 完全查不到→None。"""
+    url = _recover_collect(pid)
+    if url:
+        return {"done": True, "error": "", "url": url}
+    try:
+        q = comfy_get("/queue")
+        run_ids = [e[1] for e in q.get("queue_running", [])]
+        pen_ids = [e[1] for e in q.get("queue_pending", [])]
+        if pid in run_ids:
+            return {"done": False, "error": "", "url": "", "state": "running",
+                    "pos": 0, "run_elapsed": 0}
+        if pid in pen_ids:
+            return {"done": False, "error": "", "url": "", "state": "queued",
+                    "pos": pen_ids.index(pid) + 1, "run_elapsed": 0}
+        hist = comfy_get(f"/history/{pid}")
+        h = hist.get(pid)
+        if h:
+            st = h.get("status", {})
+            if st.get("status_str") == "error":
+                return {"done": False, "error": "生成失败:多半是缺模型/缺辅助模型,或提示词有问题", "url": ""}
+            if st.get("completed") and not st.get("outputs"):
+                return {"done": False, "error": "找不到输出文件", "url": ""}
+    except Exception:
+        return None
+    return None
 
 # ---------------- 预定批量(batch_images.py 的网页版) ----------------
 # 逻辑同 batch_images.py: 逐模型逐提示词提交→轮询等真完成(不是入队就算完)
@@ -2192,6 +2669,49 @@ code{background:var(--chip-bg);border-radius:6px;padding:2px 8px;font-size:13px;
   border:1px solid var(--chip-bd)}
 input[type=range]{accent-color:var(--accent);height:22px}
 input[type=radio],input[type=checkbox]{accent-color:var(--accent);width:15px;height:15px}
+/* 内存条可视化(锁定/模型占用预览) — 全主题适配 + 动画 */
+.membar{position:relative;height:20px;border-radius:10px;overflow:hidden;
+  background:var(--card-sel);border:1px solid var(--border);
+  display:flex;margin:7px 0 6px;box-shadow:inset 0 1px 3px rgba(0,0,0,.10)}
+.membar i{display:block;height:100%;transition:width .3s ease}
+/* 已用: 跟随主题灰阶,深浅主题都协调 */
+.membar .m-used{background:linear-gradient(180deg,rgba(255,255,255,.22),rgba(0,0,0,.10)),
+  color-mix(in srgb,var(--muted) 62%,var(--card))}
+/* 锁定: 红色渐变 + 呼吸光晕(红色段装黄色模型段) */
+.membar .m-lock{background:linear-gradient(180deg,#ec7266 0%,#c93e37 100%);position:relative;
+  box-shadow:0 0 6px rgba(217,83,79,.35);animation:mpulse 2.8s ease-in-out infinite}
+@keyframes mpulse{0%,100%{box-shadow:0 0 4px rgba(217,83,79,.30)}50%{box-shadow:0 0 14px rgba(217,83,79,.65)}}
+/* 模型: 金色渐变 */
+.membar .m-model{background:linear-gradient(180deg,#f7dd7a 0%,#dfb63c 100%)}
+.membar .m-model.abs{position:absolute;left:0;top:0;box-shadow:0 0 6px rgba(232,197,85,.5)}
+/* 空闲: 用主题的正绿 --on,深浅主题自动协调 */
+.membar .m-free{background:linear-gradient(180deg,rgba(255,255,255,.25),rgba(0,0,0,.08)),var(--on);opacity:.9}
+/* 扫光: 一道高光周期性扫过,高级感来源 */
+.membar::after{content:'';position:absolute;inset:0;pointer-events:none;
+  background:linear-gradient(105deg,transparent 42%,rgba(255,255,255,.22) 50%,transparent 58%);
+  transform:translateX(-110%);animation:msweep 4.2s ease-in-out infinite}
+@keyframes msweep{0%{transform:translateX(-110%)}55%,100%{transform:translateX(110%)}}
+/* 警告态: 红框高亮(不用抖动,避免悬停时晃眼) */
+.membar.warn{border-color:#d9534f;box-shadow:0 0 0 3px rgba(217,83,79,.20),inset 0 1px 3px rgba(0,0,0,.10)}
+/* 内存条吸顶: 毛玻璃悬浮,滚动时始终可见 */
+.memstick{position:sticky;top:6px;z-index:6;background:var(--glass);
+  -webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);
+  box-shadow:var(--shadow-md);border-radius:14px}
+/* 图例: 主题色胶囊芯片,悬停微浮起 */
+.memlegend{display:flex;flex-wrap:wrap;gap:6px;font-size:12px;color:var(--muted);margin-top:3px}
+.memlegend span{display:inline-flex;align-items:center;background:var(--chip-bg);
+  border:1px solid var(--chip-bd);border-radius:999px;padding:2px 10px;transition:.18s}
+.memlegend span:hover{transform:translateY(-1px);box-shadow:var(--shadow-sm)}
+.memlegend b{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}
+@media (prefers-reduced-motion:reduce){
+  .membar::after,.membar .m-lock{animation:none!important}}
+/* iOS 风开关(内存锁定用) */
+.switch{position:relative;display:inline-block;width:42px;height:24px;margin-left:8px;vertical-align:middle}
+.switch input{opacity:0;width:0;height:0}
+.switch i{position:absolute;inset:0;background:var(--border);border-radius:24px;transition:.2s;cursor:pointer}
+.switch i:before{content:'';position:absolute;width:20px;height:20px;left:2px;top:2px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 3px rgba(0,0,0,.25)}
+.switch input:checked+i{background:var(--accent)}
+.switch input:checked+i:before{transform:translateX(18px)}
 .proxy-switch{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:3px;padding:3px;margin:8px 0 5px;
   background:var(--input);border:1px solid var(--border);border-radius:8px;box-shadow:inset 0 1px 2px rgba(20,30,70,.08)}
 .proxy-switch button{min-width:0;padding:8px 10px;border:0;border-radius:6px;background:transparent;color:var(--muted);
@@ -2244,18 +2764,17 @@ input[type=radio],input[type=checkbox]{accent-color:var(--accent);width:15px;hei
 .logbox{background:var(--input);border:1px solid var(--border);border-radius:11px;padding:10px 13px;
   margin-top:12px;font-size:12.5px;font-family:ui-monospace,Menlo,monospace;line-height:1.65;
   max-height:260px;overflow-y:auto;white-space:pre-wrap;word-break:break-all}
-#themeBtn{position:fixed;top:16px;right:16px;z-index:99;width:42px;height:42px;padding:0;border-radius:999px;
+#themeBtn,#testBtn,#memBtn{position:fixed;top:16px;z-index:99;width:42px;height:42px;padding:0;border-radius:999px;
   font-size:18px;line-height:1;display:flex;align-items:center;justify-content:center;
   background:var(--glass);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
   color:var(--text);box-shadow:var(--shadow-sm);border:1px solid var(--border);
   transition:transform .2s,box-shadow .2s}
+#themeBtn{right:16px}
+#testBtn{right:66px;cursor:pointer}
+#memBtn{right:116px;cursor:pointer}
 #themeBtn:hover{transform:rotate(15deg) scale(1.08);box-shadow:var(--shadow-md)}
-#testBtn{position:fixed;top:16px;right:66px;z-index:99;width:42px;height:42px;padding:0;border-radius:999px;
-  font-size:18px;line-height:1;display:flex;align-items:center;justify-content:center;
-  background:var(--glass);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
-  color:var(--text);box-shadow:var(--shadow-sm);border:1px solid var(--border);cursor:pointer;
-  transition:transform .2s,box-shadow .2s}
 #testBtn:hover{transform:rotate(40deg) scale(1.08);box-shadow:var(--shadow-md)}
+#memBtn:hover{transform:scale(1.12);box-shadow:var(--shadow-md)}
 
 /* ---- 动效层: 白天模式动态渐变背景 + 入场动画 + 加载 ---- */
 /* 白天: 两团柔和色块缓慢漂移(黑夜模式自动变淡变慢,不抢戏) */
@@ -2689,6 +3208,7 @@ body.solar textarea:focus,body.solar input:focus,body.solar select:focus{box-sha
 </style></head><body>
 <button id="themeBtn" onclick="toggleTheme()" title="切换主题">🌙</button>
 <button id="testBtn" onclick="goStep(70)" title="测试场(图片/语音)">⚙️</button>
+<button id="memBtn" onclick="memModalOpen()" title="内存锁定 / 一键腾内存">🧹</button>
 <h1>🎨 ImageVideoStudio · 生图/生视频小助手</h1>
 <div id="app"></div>
 <script>
@@ -2931,7 +3451,133 @@ async function home(){
     : (ts.running
       ? `<div class="card" onclick="goStep(60)"><b>🎙 语音模型</b> <span class="dot off">◐ 加载中…</span><div class="small">点击进入查看</div></div>`
       : `<div class="card" onclick="goStep(60)"><b>🎙 语音模型</b> <span class="dot off">○ 未启动</span><div class="small">点击进入(很轻,不影响其它服务)</div></div>`);
-  $('#app').innerHTML = `<h2>选一个开始</h2>` + imgCard + vidCard + llmCard + ttsCard;
+  // 首页保持简洁: 四个功能卡 + 补丁管理入口;内存锁定/清理收进右上角 🧹 弹窗(按钮在静态页头,全局常驻)
+  const loraCard = `<div class="card" onclick="goStep(95)"><b>🧩 LoRA/补丁管理</b> <span class="dot on">·</span><div class="small">图片补丁统一目录 models/image/loras,勾选启用(支持 LyCORIS)</div></div>`;
+  $('#app').innerHTML = `<h2>选一个开始</h2>` + imgCard + vidCard + llmCard + ttsCard + loraCard;
+}
+// ============ 🧹 内存弹窗: 锁定配置 + 清理,替代原首页大卡片 ============
+async function memModalOpen(){
+  const ml = await j('/api/memlock'); window.ML = ml;
+  const mask=_dlgOpen(`
+    <b>🔒 内存锁定</b>
+    <label class="switch" title="开启后系统会把这块内存优先划给大模型;即使本程序没开也生效,重启电脑自动还原">
+      <input id="mmlSwitch" type="checkbox" ${ml.enabled?'checked':''}><i></i></label>
+    <select id="mmlGb" style="margin-left:8px">
+      ${(ml.options_gb||[]).map(g=>`<option value="${g}" ${g===ml.gb?'selected':''}>${g} GB</option>`).join('')}</select>
+    <div id="mmlBar" style="margin-top:10px">${memBarHtml(ml)}</div>
+    <div class="small" id="mmlInfo" style="margin-top:6px">${memlockInfo(ml)}</div>
+    <div class="row" style="margin-top:10px">
+      <button class="back" style="margin:0" id="mmlFree">🧹 一键腾内存</button>
+      <span class="small">锁只是把上限抬起来,不是预占;拨回开关即还原,重启电脑也还原。</span>
+    </div>
+    <div class="dbtns"><button class="dok">关闭</button></div>`);
+  const refresh=async()=>{
+    const s=await j('/api/memlock'); window.ML=s;
+    mask.querySelector('#mmlSwitch').checked=!!s.enabled;
+    mask.querySelector('#mmlGb').value=s.gb;
+    mask.querySelector('#mmlBar').innerHTML=memBarHtml(s);
+    mask.querySelector('#mmlInfo').innerHTML=memlockInfo(s);
+  };
+  mask.querySelector('#mmlSwitch').onchange=e=>{
+    j('/api/memlock',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({enabled:e.target.checked, gb:+mask.querySelector('#mmlGb').value})}).then(refresh);
+  };
+  mask.querySelector('#mmlGb').onchange=e=>{
+    j('/api/memlock',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({enabled:mask.querySelector('#mmlSwitch').checked, gb:+e.target.value})}).then(refresh);
+  };
+  mask.querySelector('#mmlFree').onclick=()=>{ mask.remove(); memFreeAsk(); };
+  mask.querySelector('.dok').onclick=()=>mask.remove();
+  mask.onmousedown=e=>{ if(e.target===mask) mask.remove(); };
+}
+async function styleSet(v){
+  const r = await j('/api/style', {method:'POST', headers:{'Content-Type':'application/json'},
+                                   body:JSON.stringify({style:v})});
+  if(r && r.error) cAlert(r.error);
+}
+function memBarHtml(s, modelGb, resident){
+  const total=Math.max(1,s.total_mb)/1024, usedRaw=(s.used_mb||0)/1024;
+  const lock=s.enabled?(s.gb||0):0;
+  const model=modelGb||0;
+  // resident=true 表示该模型已加载驻留,其占用已包含在 used 里,需剔除避免与锁定区重复计算
+  const res=(resident&&model>0)?Math.min(model,usedRaw):0;
+  const used=usedRaw-res;
+  const pct=v=>Math.max(0,Math.min(100,v/total*100));
+  const usedW=pct(used), lockW=pct(Math.min(lock, Math.max(0,total-used)));
+  let freeW=Math.max(0,100-usedW-lockW);
+  // 警告: 模型超过锁定值(黄色装不进红色), 或无锁定时模型+已用超总量
+  const over=(lock>0 && model>lock) || (lock===0 && model>0 && used+model>total);
+  // 黄色模型段: 有锁定→嵌在红色里(占锁定的比例); 无锁定→作为普通段跟在已用后面,挤占空闲
+  let modelInside='', modelSeg='';
+  if(model>0 && lock>0){
+    modelInside=`<em class="m-model abs" style="width:${Math.min(100,model/lock*100)}%" title="模型将占用约 ${model} GB(在锁定区内)"></em>`;
+  }else if(model>0){
+    const mw=Math.min(freeW,pct(model));
+    modelSeg=`<i class="m-model" style="width:${mw}%" title="模型将占用约 ${model} GB"></i>`;
+    freeW-=mw;
+  }
+  return `<div class="membar ${over?'warn':''}">
+    <i class="m-used" style="width:${usedW}%" title="系统已用 ${used.toFixed(1)} GB${res>0?`(含模型驻留 ${res} GB,已并入锁定区)`:''}"></i>
+    <i class="m-lock" style="width:${lockW}%" title="内存锁定(预留) ${lock} GB">${modelInside}</i>
+    ${modelSeg}
+    <i class="m-free" style="width:${freeW}%" title="空闲"></i></div>
+  <div class="memlegend"><span><b style="background:#8a8f98"></b>已用 ${used.toFixed(1)}G${res>0?`(模型${res}G在内)`:''}</span>
+    <span><b style="background:#d9534f"></b>锁定预留 ${lock}G</span>
+    ${model>0?`<span><b style="background:#e8c555"></b>模型约 ${model}G${lock>0&&model>lock?'<span style="color:#d9534f;font-weight:600"> ⚠️超锁定值</span>':''}</span>`:''}
+    <span><b style="background:#5cb85c"></b>空闲 ${Math.max(0,total-used-lock).toFixed(1)}G / 共 ${total.toFixed(0)}G</span>
+    ${over&&lock===0?'<span style="color:#d9534f;font-weight:600">⚠️ 剩余内存不够跑这个模型,先关应用</span>':''}</div>`;
+}
+function memlockInfo(ml){
+  const tot=(ml.total_mb/1024).toFixed(0);
+  if(ml.enabled){
+    const left=ml.total_mb/1024-(ml.used_mb||0)/1024-ml.gb;
+    return `已锁定 ${ml.gb} GB(GPU 上限 ${(ml.current_mb/1024).toFixed(0)} GB / 总 ${tot} GB)`
+      +(left<0?' · ⚠️ 系统已用+锁定超过总量,先关掉大应用':` · 锁定后约剩 ${left.toFixed(1)} GB 给模型`);
+  }
+  return `未锁定:下拉随便选,红色段实时预览;拨开关才真正锁定生效(GPU 上限当前 ${(ml.current_mb/1024).toFixed(0)} GB)`;
+}
+async function memlockApply(enabled, gb){
+  const r = await j('/api/memlock', {method:'POST', headers:{'Content-Type':'application/json'},
+                                     body:JSON.stringify({enabled:enabled, gb:+gb})});
+  if(r && r.error) cAlert(r.error + (r.manual ? '\n\n也可以手动在终端执行:\n' + r.manual : ''));
+  home();  // 刷新卡片状态
+}
+function memlockToggle(on){
+  if(window.ML) ML.enabled=on;
+  const gb=($('#mlGb')?$('#mlGb').value:25);
+  const b=$('#mlBar'); if(b) b.innerHTML=memBarHtml(ML);
+  const info=$('#mlInfo'); if(info) info.textContent=memlockInfo(ML);
+  memlockApply(on, gb);   // 拨开关这一刻才真正改系统(开启会弹一次密码框)
+}
+function memlockGb(v){
+  const on=((document.querySelector('.switch input')||{}).checked);
+  if(window.ML){ ML.enabled=!!on; ML.gb=+v; }
+  const b=$('#mlBar'); if(b) b.innerHTML=memBarHtml(ML);
+  const info=$('#mlInfo'); if(info) info.textContent=memlockInfo(ML);
+  // 只保存档位偏好,不动系统;拨开关时才真正生效
+  j('/api/memlock',{method:'POST',headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({enabled:!!on,gb:+v,apply:false})});
+}
+function memPreview(gb){
+  const el=$('#mmBar'); if(!el) return;
+  const html=memBarHtml(window.ML||{}, gb);
+  if(el._mh===html) return;   // 悬停内容没变就不重绘,避免闪烁
+  el._mh=html; el.innerHTML=html;
+}
+function memFreeAsk(){
+  cConfirm('将停止本地大模型服务(生图/生视频/语言),并退出 VS Code。\n不会动浏览器(页面不会关);其他大应用(浏览器多开的标签等)建议手动清理。腾出的内存给生图用。', '退出并腾内存')
+    .then(ok=>{ if(ok) memFree(true); });
+}
+async function memFree(apps){
+  const r = await j('/api/memfree', {method:'POST', headers:{'Content-Type':'application/json'},
+                                     body:JSON.stringify({apps:!!apps})});
+  if(r && r.ok){
+    cAlert(`已腾出 ${(r.freed_mb/1024).toFixed(1)} GB(系统已用 ${(r.before_mb/1024).toFixed(1)} → ${(r.after_mb/1024).toFixed(1)} GB)\n`
+         + `停掉了:${(r.stopped||[]).join('、')||'(没有可停的)'}\n现在回首页重新启动生图服务即可。`);
+    home();
+  } else {
+    cAlert('清理失败:' + ((r||{}).error || '未知错误'));
+  }
 }
 function goStep(n){ ST.step=n; render(); }
 function enterVideo(){ ST._videoTaskOnly=false; startAndGo('vid',10); }
@@ -2985,27 +3631,45 @@ async function render(){
   if(ST.step===1){
     const ms = await j('/api/models');
     ST.hasCN = (await j('/api/status')).has_cn;
-    $('#app').innerHTML = `<h2>第二步:选生图模型</h2>` + tabHtml(0) + `
+    let mlBar='';
+    try{ const s=await j('/api/memlock'); window.ML=s;
+      mlBar=`<div class="box memstick" style="padding:10px 12px"><div class="small" style="margin-bottom:3px">💻 内存状况${s.enabled?` · 已锁定 <b>${s.gb} GB</b>`:' · <b>未锁定</b>'} — 悬停模型卡片,黄色 = 它要占用的内存 <button class="back" style="padding:1px 9px;font-size:12px" onclick="event.stopPropagation();memFreeAsk()">🧹 腾内存</button></div><div id="mmBar">${memBarHtml(s)}</div></div>`;
+    }catch(e){}
+    $('#app').innerHTML = `<h2>第二步:选生图模型</h2>` + tabHtml(0) + mlBar + `
       <p class="small">右上角竖条 = 生成速度;时间着色:<span class="mtime g">绿 &lt;3分钟</span> / <span class="mtime y">黄 3~5分钟</span> / <span class="mtime r">红 &gt;5分钟·慢</span></p>` + ms.map((m,mi)=>`
-      <div class="card drop-in" style="animation-delay:${mi*80}ms" onclick="pickModel('${m.id}','${m.name}',${m.sec},'${m.kind}')">
+      <div class="card drop-in" style="animation-delay:${mi*80}ms" onmouseover="memPreview(${m.mem_gb||0})" onmouseout="memPreview(0)" onclick="pickModel('${m.id}','${m.name}',${m.sec},'${m.kind}',${m.q21?true:false},${m.mem_gb||0},${m.turbo?true:false},${m.sdxl_clip?true:false})">
         <span class="wifi ${m.speed||'mid'}" title="生成速度"><i></i><i></i><i></i></span>
         <b>${m.name}</b> <span class="small mtime ${secCls(m.sec)}">${m.time||('约'+m.sec+'秒')}/张</span>
         ${m.field?`<div><span class="mfield">🎯 ${m.field}</span></div>`:''}
         <div class="small">${m.detail||m.desc}</div>
         ${m.mem?`<div><span class="mmem">💾 启动约占内存 ${m.mem}</span></div>`:''}
+        ${m.mem_gb?`<div><span class="mmem" title="运行期间最大内存占用峰值,内存锁定建议 ≥ 此值">📈 峰值约${m.mem_gb}GB</span></div>`:''}
       </div>`).join('') + `<p><button class="back" onclick="home()">← 返回</button></p>`;
   }
   if(ST.step===3){
+    try{ ST.caps=await j('/api/caps'); ST.hasCN=!!ST.caps.has_cn; }catch(e){ ST.caps=ST.caps||null; }
     let cards='';
     for(let i=0;i<ST.items.length;i++){ if(!ST.items[i]) ST.items[i]=newItem(); cards += cardHTML(i); }
+    let mbar='';
+    try{ const s=await j('/api/memlock'); window.ML=s;
+      mbar=`<div class="box" style="padding:8px 12px"><div id="mmBar">${memBarHtml(s, ST.mmem||0, !!s.img_running)}</div>
+        <div class="small" style="margin-top:2px">${s.enabled?`已锁定 ${s.gb} GB`:'未锁定(首页🧹可开)'} · 黄段 = 「${esc(ST.mname)}」将占用${s.img_running?'(已加载驻留)':''}</div></div>`;
+    }catch(e){}
+    // 画风锁定(全局,与 ⚙️测试场 共用): 生图功能归生图页管
+    let stc={style:'free',presets:[],note:''};
+    try{ stc=await j('/api/style'); }catch(e){}
+    const styleRow=`<div class="box" style="padding:8px 12px"><b>🎨 画风锁定</b>
+      <select onchange="styleSet(this.value)" style="margin-left:8px">
+        ${(stc.presets||[]).map(p=>`<option value="${p.id}" ${p.id===stc.style?'selected':''}>${p.label}</option>`).join('')}</select>
+      <span class="small" style="margin-left:8px;cursor:help" title="${stc.note||''}">ⓘ 作用与建议</span></div>`;
     $('#app').innerHTML = `<h2>第三步:每张图单独设置</h2>
-      <p class="small">模型:${ST.mname}(约${ST.msec}秒/张) · 不想要某张就点卡片右上角 ✕</p>${cards}
+      <p class="small">模型:${ST.mname}(约${ST.msec}秒/张) · 不想要某张就点卡片右上角 ✕</p>${mbar}${styleRow}${featGuideHtml()}${cards}
       <p><button class="back" onclick="addCard()">＋ 加一张图</button></p>
       <p><button onclick="startGen()">🚀 开始生成</button>
       <button class="back" onclick="ST.step=1;render()">← 返回</button></p>`;
     for(let i=0;i<ST.items.length;i++){
       if(ST.items[i].mode==='inpaint') initMaskCanvas(i);
-      if(ST.items[i].mode==='pose'&&ST.items[i].poseSrc==='draw') initPoseCanvas(i);
+      if(ST.items[i].mode==='pose'&&ST.items[i].poseSrc!=='upload') initPoseCanvas(i);
       drawSzBox(i);
     }
   }
@@ -3853,14 +4517,19 @@ async function render(){
     const d = await j('/api/test/state');
     const T = ST.test;
     T.all = d.models;   // 可选模型清单,供「全选」用
+    let mlBar='';
+    try{ const s=await j('/api/memlock'); window.ML=s;
+      mlBar=`<div class="box memstick" style="padding:10px 12px"><div class="small" style="margin-bottom:3px">💻 内存状况${s.enabled?` · 已锁定 <b>${s.gb} GB</b>`:' · <b>未锁定</b>'} — 悬停模型卡片看占用(黄色);多选模型是逐个跑,不是同时占</div><div id="mmBar">${memBarHtml(s)}</div></div>`;
+    }catch(e){}
     const cards = d.models.map((m,mi)=>{
       const on = T.models.find(x=>x.id===m.id);
-      return `<div class="card drop-in ${on?'sel':''}" style="animation-delay:${mi*70}ms" onclick="testToggleModel('${m.id}','${esc(m.name)}',${m.sec||60},this)">
+      return `<div class="card drop-in ${on?'sel':''}" style="animation-delay:${mi*70}ms" onmouseover="memPreview(${m.mem_gb||0})" onmouseout="memPreview(0)" onclick="testToggleModel('${m.id}','${esc(m.name)}',${m.sec||60},this)">
         <b>${esc(m.name)}</b> <span class="small mtime ${secCls(m.sec)}">${m.time||('约'+m.sec+'秒')}/张</span>
         <div class="small">${esc(m.desc||'')}</div></div>`;
     }).join('');
     $('#app').innerHTML = `<h2>图片测试 ① 选模型</h2>
       <div class="box">点选一个或多个模型(可全选对比同一套提示词)。已选 <b id="tcount">${T.models.length}</b> 个。<button class="back" style="padding:4px 12px;font-size:13px;margin-left:8px" onclick="testSelectAll()">☑ 全选/清空</button></div>
+      ${mlBar}
       ${cards}
       <div class="box" id="torder">${testOrderHtml()}</div>
       <p><button class="back" onclick="goStep(70)">← 取消</button>
@@ -4056,8 +4725,46 @@ async function render(){
     const r=await j('/api/video-test/prompts?f='+encodeURIComponent(ST.videoTestEditId||''));
     $('#app').innerHTML=`<div class="vt-page"><h2>✏️ 视频任务 ${esc(ST.videoTestEditId||'')} 提示词</h2><div class="box">一行一条。保存后，尚未开始的下一段视频会读取新内容。</div><textarea id="vtpe" style="height:200px">${esc(r.text||'')}</textarea><p><button class="back" onclick="goStep(ST.videoReturnStep||89)">← 视频任务</button><button onclick="videoTestSavePrompts()">💾 保存</button></p></div>`;
   }
+  if(ST.step===95){ // LoRA/LyCORIS 补丁管理: 统一目录 + 勾选启用(状态持久化,重启保持)
+    const d=await j('/api/loras');
+    ST.loraMgr=d.loras||[];
+    let curCat='';
+    const rows=ST.loraMgr.map(l=>{
+      let head='';
+      if(l.cat!==curCat){ curCat=l.cat; head=`<h3 style="margin:14px 0 6px">${esc(l.cat)}</h3>`; }
+      return head+`<div class="card" style="cursor:default;padding:12px 16px">
+      <label style="margin:0;display:flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" ${l.enabled?'checked':''} onchange="loraEnable('${esc(l.name)}',this.checked)">
+      <b>${esc(l.name)}</b><span class="small">${l.size_mb} MB</span></label>
+      ${l.desc?`<div class="small" style="margin-top:4px"><b>大白话：</b>${esc(l.desc)}</div>`:''}
+      ${l.pair?`<div class="small" style="margin-top:2px;color:var(--ac,#7aa2f7)"><b>建议搭配：</b>${esc(l.pair)}</div>`:''}</div>`;
+    }).join('');
+    $('#app').innerHTML=`<h2>🧩 LoRA / LyCORIS 补丁管理</h2>
+      <div class="box"><b>统一目录:</b>把补丁文件(.safetensors,LoRA 和 LyCORIS 都支持)放进 <code>${esc(d.dir||'models/image/loras')}</code>,回到本页点「刷新」即可看到。<br>
+      <b>勾选 = 启用:</b>只有勾选的补丁会出现在生图卡片的「LoRA 补丁」栏里;勾选状态自动保存,重启服务/重开网页都保持。<br>
+      <span class="small">新放进目录的文件默认启用。注意补丁要和底模配套:SDXL/Illustrious/Pony 的补丁只配 SDXL 系模型(如 wai/NoobAI),Qwen 的补丁只配 Qwen,Flux 的补丁只配 Flux。同一类姿势补丁一次只开一个,画风补丁一次也只开一个,叠加太多会互相干扰。视频 LoRA 是另一套(models/video/),不在这里。</span></div>
+      ${rows||'<div class="box">目录是空的,还没有补丁。去 Civitai 下载 .safetensors 放进上面的目录即可(桌面上「LoRA-LyCORIS推荐清单.html」有精选列表)。</div>'}
+      <p><button class="back" onclick="render()">🔄 刷新</button>
+      <button class="back" onclick="home()">🏠 回首页</button></p>`;
+  }
 }
-function newItem(){ return {mode:'t2i',w:1024,h:576,pos:'',neg:NEG_DEF,defPos:'masterpiece, best quality',strength:0.6,scale:2,ctype:'openpose',refFile:null,strokes:[],brush:30,poseSrc:'draw',joints:null,resultUrl:null}; }
+function newItem(){ return {mode:'t2i',w:1024,h:576,pos:'',neg:NEG_DEF,defPos:'masterpiece, best quality',strength:0.6,scale:2,ctype:'openpose',refFile:null,strokes:[],brush:30,poseSrc:'draw',joints:null,resultUrl:null,
+  composition:'',poseStrict:true,traceFile:null,
+  faceLock:false,ipaFile:null,ipaWeight:0.3,ipaEnd:1.0,faceid:false,
+  facefix:false,fast:false,loras:[],
+  maskTool:'brush',wandTol:40,feather:6,
+  pad:{l:0,t:0,r:0,b:0},upmodel:''}; }
+function dupItem(i){ // 复制卡片(同人多姿势/同参数变体): 设置全抄,结果不抄
+  collect(i); const src=ST.items[i];
+  const c=Object.assign(newItem(), JSON.parse(JSON.stringify(Object.assign({},src,{refFile:null,ipaFile:null,traceFile:null,resultUrl:null,strokes:[],joints:src.joints?JSON.parse(JSON.stringify(src.joints)):null,_maskCv:undefined,_undo:undefined,_img:undefined,_traceImg:undefined,_poly:undefined,_maskDirty:false}))));
+  c.refFile=src.refFile; c.ipaFile=src.ipaFile; c.traceFile=src.traceFile;  // File 对象不能 JSON,直接引用
+  ST.items.splice(i+1,0,c); render();
+}
+async function loraEnable(name,on){ // 勾选/取消某个补丁,保存到 config.json(黑名单制)
+  (ST.loraMgr||[]).forEach(l=>{ if(l.name===name) l.enabled=on; });
+  const disabled=(ST.loraMgr||[]).filter(l=>!l.enabled).map(l=>l.name);
+  const r=await j('/api/loras',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({disabled})});
+  if(r&&r.error) cAlert(r.error);
+}
 // ---- 视频 I2V 交互 ----
 function vSet(k,val,rerender){ ST.vid[k]=val; if(rerender) render(); }
 function vToggleLora(id,on){ const v=ST.vid; if(!Array.isArray(v.loras))v.loras=[]; const i=v.loras.indexOf(id); if(on&&i<0)v.loras.push(id); if(!on&&i>=0)v.loras.splice(i,1); v.lora=v.loras[0]||'none'; }
@@ -4963,7 +5670,7 @@ async function bubExport(){
   if(r.error){ cAlert('导出失败: '+r.error); return; }
   B.flat=r.url; render();
 }
-function pickModel(id,name,sec,kind){ ST.model=id; ST.mname=name; ST.msec=sec; ST.kind=kind; if(!ST.items.length) ST.items.push(newItem()); ST.step=3; render(); }
+function pickModel(id,name,sec,kind,q21,memgb,turbo,sdxlClip){ ST.model=id; ST.mname=name; ST.msec=sec; ST.kind=kind; ST.q21=!!q21; ST.turbo=!!turbo; ST.sdxlClip=!!sdxlClip; ST.mmem=+memgb||0; if(!ST.items.length) ST.items.push(newItem()); ST.step=3; render(); }
 function hqOpen(){
   ST.hq=ST.hq||{session:'hq_'+Date.now(),model:'',faceSize:'1024x1024',count:1,bust:'natural',waist:'natural',hip:'natural',size:'832x1216',batchNo:0,variants:[],selected:-1};
   ST.step=90; render();
@@ -5044,11 +5751,15 @@ function collect(i){
   if($('#scale'+i)) it.scale=+$('#scale'+i).value;
   if($('#ctype'+i)) it.ctype=$('#ctype'+i).value;
   if($('#brush'+i)) it.brush=+$('#brush'+i).value;
+  if($('#comp'+i)) it.composition=$('#comp'+i).value;
+  if($('#feather'+i)) it.feather=+$('#feather'+i).value;
+  if($('#upmodel'+i)) it.upmodel=$('#upmodel'+i).value;
+  if($('#padl'+i)) it.pad={l:+$('#padl'+i).value||0,t:+$('#padt'+i).value||0,r:+$('#padr'+i).value||0,b:+$('#padb'+i).value||0};
 }
 function setMode(i){
   collect(i); const it=ST.items[i];
   it.mode=$('#mode'+i).value;
-  it.strength={i2i:0.6,upscale:0.35,pose:0.8}[it.mode]||0.6;
+  it.strength={i2i:0.6,upscale:0.35,pose:0.8,restore:0.3,outpaint:1.0}[it.mode]||0.6;
   render();
 }
 function getTags(target){ // 读该组提示词标签(用户自定义存浏览器本地,默认用预置)
@@ -5134,7 +5845,7 @@ function dropRef(i,e){
   if(!f.type.startsWith('image/')){ cAlert('拖进来的不是图片文件!'); return; }
   collect(i); setRef(i,f);
 }
-function setRef(i,f){ ST.items[i].refFile=f; ST.items[i].strokes=[]; render(); }
+function setRef(i,f){ ST.items[i].refFile=f; ST.items[i].strokes=[]; ST.items[i]._maskCv=null; ST.items[i]._maskDirty=false; ST.items[i]._undo=[]; ST.items[i]._poly=null; render(); }
 async function refLibToggle(i){ // 展开/收起参考图库,列出缩略图供点选当垫图
   const box=$('#reflib'+i); if(!box) return;
   if(box.style.display!=='none'){ box.style.display='none'; return; }
@@ -5159,11 +5870,26 @@ function strRow(i,label,tip){
            oninput="$('#strV${i}').textContent=(+this.value).toFixed(2)"><span class="small">${tip}</span></div>`;
 }
 function maskRow(i){
-  return `<label>涂抹要重画的区域(红=重画,其余不动)</label><div class="row">
-      <span style="font-size:13px">笔刷</span>
-      <input type="range" id="brush${i}" min="10" max="80" step="5" value="${ST.items[i].brush}" style="width:120px">
-      <button class="back" style="padding:4px 12px;font-size:13px" onclick="clearMask(${i})">清除涂抹</button></div>
-    <canvas id="mcanvas${i}" style="max-width:100%;border-radius:8px;border:1px dashed #bbb;cursor:crosshair;touch-action:none"></canvas>`;
+  const it=ST.items[i];
+  const t=(id,label,tip)=>`<button type="button" class="back" style="padding:4px 10px;font-size:13px;${it.maskTool===id?'border-color:var(--accent);color:var(--accent)':''}" title="${tip}" onclick="collect(${i});ST.items[${i}].maskTool='${id}';render()">${label}</button>`;
+  return `<label>选择要重画的区域(红=重画,其余原样保留)</label>
+    <div class="row" style="flex-wrap:wrap">
+      ${t('brush','🖌 画笔','涂抹要改的区域,适合大范围')}
+      ${t('eraser','🧽 橡皮','擦掉多涂的部分')}
+      ${t('lasso','⭕ 套索','逐点圈出区域后点「闭合填充」——圈脸/圈物体最精准')}
+      ${t('wand','✨ 魔术棒','点一下,颜色相近的整片区域自动选中——头发/天空/纯色背景神器')}
+      <button type="button" class="back" style="padding:4px 10px;font-size:13px" onclick="maskUndo(${i})">↩ 撤销</button>
+      <button type="button" class="back" style="padding:4px 10px;font-size:13px" onclick="clearMask(${i})">清除全部</button></div>
+    <div class="row" style="margin-top:6px;flex-wrap:wrap">
+      <span style="font-size:13px">笔刷 <b>${it.brush}</b></span>
+      <input type="range" id="brush${i}" min="5" max="120" step="5" value="${it.brush}" style="width:110px" oninput="ST.items[${i}].brush=+this.value;this.previousElementSibling.innerHTML='笔刷 <b>'+this.value+'</b>'">
+      ${it.maskTool==='wand'?`<span style="font-size:13px">容差 <b id="wandTv${i}">${it.wandTol}</b></span><input type="range" min="5" max="120" step="5" value="${it.wandTol}" style="width:100px" oninput="ST.items[${i}].wandTol=+this.value;$('#wandTv${i}').textContent=this.value">`:''}
+      ${it.maskTool==='lasso'?`<button type="button" class="back" style="padding:4px 10px;font-size:13px" onclick="lassoClose(${i})">✔ 闭合填充</button><button type="button" class="back" style="padding:4px 10px;font-size:13px" onclick="lassoCancel(${i})">✖ 取消圈点</button>`:''}
+      <span style="font-size:13px">边缘羽化 <b id="featherV${i}">${it.feather}</b></span>
+      <input type="range" id="feather${i}" min="0" max="20" step="1" value="${it.feather}" style="width:90px" oninput="ST.items[${i}].feather=+this.value;$('#featherV${i}').textContent=this.value">
+      <span class="small">羽化让接缝自然,改脸建议 6~10</span></div>
+    <canvas id="mcanvas${i}" style="max-width:100%;border-radius:8px;border:1px dashed #bbb;cursor:crosshair;touch-action:none"></canvas>
+    <div class="small">💡 改脸部推荐:✨魔术棒点脸/头发,或⭕套索沿脸圈一圈——比画笔涂更贴边,不会误伤背景导致前后背景不一致。</div>`;
 }
 function initMaskCanvas(i){
   const it=ST.items[i]; const cv=document.getElementById('mcanvas'+i); if(!cv) return;
@@ -5172,38 +5898,104 @@ function initMaskCanvas(i){
   img.onload=()=>{
     const sc=Math.min(1, 780/img.width);
     cv.width=Math.round(img.width*sc); cv.height=Math.round(img.height*sc);
-    it._img=img; it._sc=sc; redrawMask(i);
-    cv.onpointerdown=e=>{ it._draw=true; it._lx=null; maskDraw(i,e); };
-    cv.onpointermove=e=>{ if(it._draw) maskDraw(i,e); };
-    cv.onpointerup=cv.onpointerleave=()=>{ it._draw=false; it._lx=null; };
+    it._img=img; it._sc=sc;
+    if(!it._maskCv || it._maskCv.width!==cv.width || it._maskCv.height!==cv.height){ // 首次或换图: 建空遮罩层
+      it._maskCv=document.createElement('canvas'); it._maskCv.width=cv.width; it._maskCv.height=cv.height;
+      it._undo=[]; it._maskDirty=false;
+    }
+    redrawMask(i);
+    cv.onpointerdown=e=>{ maskDown(i,e); };
+    cv.onpointermove=e=>{ if(it._draw) maskMove(i,e); };
+    cv.onpointerup=cv.onpointerleave=()=>{ maskUp(i); };
   };
   img.src=URL.createObjectURL(it.refFile);
 }
-function maskDraw(i,e){
-  const it=ST.items[i]; const cv=document.getElementById('mcanvas'+i);
-  const r=cv.getBoundingClientRect();
-  const x=(e.clientX-r.left)*(cv.width/r.width), y=(e.clientY-r.top)*(cv.height/r.height);
-  if(it._lx!==null) it.strokes.push({x0:it._lx,y0:it._ly,x1:x,y1:y});
-  else it.strokes.push({x0:x,y0:y,x1:x,y1:y});
-  it._lx=x; it._ly=y; redrawMask(i);
+function maskPos(i,e){ const cv=document.getElementById('mcanvas'+i); const r=cv.getBoundingClientRect();
+  return [(e.clientX-r.left)*(cv.width/r.width),(e.clientY-r.top)*(cv.height/r.height)]; }
+function maskPush(i){ const it=ST.items[i]; if(!it._maskCv) return;
+  it._undo=it._undo||[]; it._undo.push(it._maskCv.toDataURL()); if(it._undo.length>15) it._undo.shift(); }
+function maskUndo(i){ const it=ST.items[i]; if(!it._undo||!it._undo.length) return;
+  const img=new Image(); img.onload=()=>{ const c=it._maskCv.getContext('2d');
+    c.clearRect(0,0,it._maskCv.width,it._maskCv.height); c.drawImage(img,0,0);
+    it._maskDirty=it._undo.length>0; redrawMask(i); };
+  img.src=it._undo.pop(); }
+function maskDown(i,e){
+  const it=ST.items[i]; const [x,y]=maskPos(i,e);
+  if(it.maskTool==='wand'){ maskPush(i); wandFill(i,Math.round(x),Math.round(y)); redrawMask(i); return; }
+  if(it.maskTool==='lasso'){ (it._poly=it._poly||[]).push([x,y]); redrawMask(i); return; }
+  maskPush(i); it._draw=true; it._lx=x; it._ly=y; maskPaint(i,x,y); }
+function maskMove(i,e){ const [x,y]=maskPos(i,e); maskPaint(i,x,y); }
+function maskUp(i){ const it=ST.items[i]; it._draw=false; }
+function maskPaint(i,x,y){
+  const it=ST.items[i]; const c=it._maskCv.getContext('2d');
+  c.globalCompositeOperation=(it.maskTool==='eraser')?'destination-out':'source-over';
+  c.strokeStyle=c.fillStyle='#fff';
+  c.lineCap='round'; c.lineJoin='round'; c.lineWidth=it.brush;
+  c.beginPath(); c.moveTo(it._lx,it._ly); c.lineTo(x,y); c.stroke();
+  c.beginPath(); c.arc(x,y,it.brush/2,0,7); c.fill();
+  c.globalCompositeOperation='source-over';
+  it._lx=x; it._ly=y; it._maskDirty=true; redrawMask(i);
 }
+function wandFill(i,px,py){ // 魔术棒: 从点击处按颜色容差漫水填充
+  const it=ST.items[i]; const W=it._maskCv.width, H=it._maskCv.height;
+  if(px<0||py<0||px>=W||py>=H) return;
+  const src=document.createElement('canvas'); src.width=W; src.height=H;
+  const sctx=src.getContext('2d'); sctx.drawImage(it._img,0,0,W,H);
+  const data=sctx.getImageData(0,0,W,H).data;
+  const o0=(py*W+px)*4, r0=data[o0], g0=data[o0+1], b0=data[o0+2];
+  const tol=it.wandTol*1.6, tol2=tol*tol*3;
+  const seen=new Uint8Array(W*H), sel=new Uint8Array(W*H);
+  const stack=[[px,py]];
+  while(stack.length){
+    const p=stack.pop(), x=p[0], y=p[1], k=y*W+x;
+    if(x<0||y<0||x>=W||y>=H||seen[k]) continue; seen[k]=1;
+    const o=k*4, dr=data[o]-r0, dg=data[o+1]-g0, db=data[o+2]-b0;
+    if(dr*dr+dg*dg+db*db>tol2) continue;
+    sel[k]=1;
+    stack.push([x+1,y],[x-1,y],[x,y+1],[x,y-1]);
+  }
+  const out=new ImageData(W,H), od=out.data;
+  for(let k=0;k<W*H;k++){ if(sel[k]){ const o=k*4; od[o]=255; od[o+1]=255; od[o+2]=255; od[o+3]=255; } }
+  const tmp=document.createElement('canvas'); tmp.width=W; tmp.height=H;
+  tmp.getContext('2d').putImageData(out,0,0);
+  const mc=it._maskCv.getContext('2d'); mc.drawImage(tmp,0,0);
+  it._maskDirty=true;
+}
+function lassoClose(i){ const it=ST.items[i];
+  if(!it._poly||it._poly.length<3){ cAlert('套索至少点 3 个点再闭合'); return; }
+  maskPush(i); const c=it._maskCv.getContext('2d');
+  c.fillStyle='#fff'; c.beginPath();
+  it._poly.forEach((p,k)=>k?c.lineTo(p[0],p[1]):c.moveTo(p[0],p[1])); c.closePath(); c.fill();
+  it._poly=[]; it._maskDirty=true; redrawMask(i); }
+function lassoCancel(i){ ST.items[i]._poly=[]; redrawMask(i); }
 function redrawMask(i){
   const it=ST.items[i]; const cv=document.getElementById('mcanvas'+i);
   if(!cv||!it._img) return;
   const c=cv.getContext('2d');
   c.drawImage(it._img,0,0,cv.width,cv.height);
-  c.strokeStyle='rgba(255,40,40,.75)'; c.lineCap='round'; c.lineJoin='round'; c.lineWidth=it.brush;
-  it.strokes.forEach(s=>{ c.beginPath(); c.moveTo(s.x0,s.y0); c.lineTo(s.x1,s.y1); c.stroke(); });
+  if(it._maskCv){ // 遮罩层染红半透明叠在图上
+    const tmp=document.createElement('canvas'); tmp.width=cv.width; tmp.height=cv.height;
+    const tc=tmp.getContext('2d');
+    tc.drawImage(it._maskCv,0,0);
+    tc.globalCompositeOperation='source-in'; tc.fillStyle='#ff2828'; tc.fillRect(0,0,tmp.width,tmp.height);
+    c.globalAlpha=0.55; c.drawImage(tmp,0,0); c.globalAlpha=1;
+  }
+  if(it._poly&&it._poly.length){ // 套索进行中的预览虚线
+    c.strokeStyle='#ff5a5a'; c.lineWidth=2; c.setLineDash([6,4]); c.beginPath();
+    it._poly.forEach((p,k)=>k?c.lineTo(p[0],p[1]):c.moveTo(p[0],p[1])); c.stroke(); c.setLineDash([]);
+    it._poly.forEach(p=>{ c.fillStyle='#ff5a5a'; c.beginPath(); c.arc(p[0],p[1],3.5,0,7); c.fill(); });
+  }
 }
-function clearMask(i){ ST.items[i].strokes=[]; redrawMask(i); }
+function clearMask(i){ const it=ST.items[i]; if(!it._maskCv) return; maskPush(i);
+  const c=it._maskCv.getContext('2d'); c.clearRect(0,0,it._maskCv.width,it._maskCv.height);
+  it._poly=[]; it._maskDirty=false; redrawMask(i); }
 function exportMask(i){
   const it=ST.items[i];
   const off=document.createElement('canvas');
   off.width=it._img.width; off.height=it._img.height;
   const c=off.getContext('2d');
   c.fillStyle='#000'; c.fillRect(0,0,off.width,off.height);
-  c.strokeStyle='#fff'; c.lineCap='round'; c.lineJoin='round'; c.lineWidth=it.brush/it._sc;
-  it.strokes.forEach(s=>{ c.beginPath(); c.moveTo(s.x0/it._sc,s.y0/it._sc); c.lineTo(s.x1/it._sc,s.y1/it._sc); c.stroke(); });
+  if(it._maskCv) c.drawImage(it._maskCv,0,0,off.width,off.height);  // 透明处留在黑底上,白色=重画区
   return new Promise(res=>off.toBlob(res,'image/png'));
 }
 // ---- 火柴人骨架编辑器(openpose 18 关节,黑底彩条,union controlnet 认这个格式) ----
@@ -5215,6 +6007,20 @@ function defaultPose(){ // 站立小人,归一化坐标(0~1)
           [.44,.52],[.44,.68],[.44,.86],[.56,.52],[.56,.68],[.56,.86],
           [.48,.11],[.52,.11],[.46,.11],[.54,.11]];
 }
+// 姿势预设: 18 关节(鼻/颈/肩肘腕×2/胯膝踝×2/眼×2/耳×2),选中后可再拖动微调
+const POSE_PRESETS={
+  stand:['站立',[[.5,.12],[.5,.24],[.40,.26],[.37,.38],[.35,.50],[.60,.26],[.63,.38],[.65,.50],[.44,.52],[.44,.68],[.44,.86],[.56,.52],[.56,.68],[.56,.86],[.48,.11],[.52,.11],[.46,.11],[.54,.11]]],
+  wave:['挥手打招呼',[[.5,.12],[.5,.24],[.40,.26],[.33,.16],[.30,.05],[.60,.26],[.63,.38],[.65,.50],[.44,.52],[.44,.68],[.44,.86],[.56,.52],[.56,.68],[.56,.86],[.48,.11],[.52,.11],[.46,.11],[.54,.11]]],
+  walk:['走路',[[.5,.12],[.5,.24],[.40,.26],[.43,.38],[.46,.50],[.60,.26],[.57,.36],[.54,.46],[.44,.52],[.38,.68],[.34,.86],[.56,.52],[.60,.66],[.66,.82],[.48,.11],[.52,.11],[.46,.11],[.54,.11]]],
+  run:['奔跑',[[.5,.12],[.5,.24],[.40,.26],[.34,.30],[.28,.22],[.60,.26],[.66,.32],[.72,.28],[.44,.52],[.34,.62],[.28,.78],[.56,.52],[.64,.60],[.72,.72],[.48,.11],[.52,.11],[.46,.11],[.54,.11]]],
+  sit:['坐下',[[.5,.14],[.5,.28],[.41,.30],[.38,.42],[.36,.54],[.59,.30],[.62,.42],[.64,.54],[.44,.56],[.34,.56],[.34,.74],[.56,.56],[.66,.56],[.66,.74],[.48,.13],[.52,.13],[.46,.13],[.54,.13]]],
+  lie:['躺下(横躺)',[[.16,.40],[.28,.40],[.24,.48],[.20,.56],[.16,.64],[.24,.32],[.18,.26],[.14,.18],[.44,.44],[.62,.46],[.80,.48],[.44,.36],[.62,.34],[.80,.32],[.14,.37],[.15,.43],[.11,.35],[.12,.45]]],
+  jump:['跳跃(四肢张开)',[[.5,.16],[.5,.28],[.40,.28],[.32,.18],[.26,.08],[.60,.28],[.68,.18],[.74,.08],[.44,.54],[.36,.66],[.32,.76],[.56,.54],[.64,.66],[.68,.76],[.48,.15],[.52,.15],[.46,.15],[.54,.15]]],
+  bow:['鞠躬/前倾',[[.56,.16],[.50,.26],[.41,.30],[.38,.42],[.36,.54],[.57,.28],[.60,.40],[.62,.52],[.45,.50],[.45,.66],[.45,.84],[.57,.48],[.57,.64],[.57,.82],[.55,.14],[.58,.15],[.53,.13],[.59,.13]]],
+};
+function posePreset(i,k){ const it=ST.items[i]; if(!k||!POSE_PRESETS[k]) return;
+  it.joints=JSON.parse(JSON.stringify(POSE_PRESETS[k][1])); drawPose(i); }
+function tracePick(i,el){ collect(i); const it=ST.items[i]; it.traceFile=el.files[0]||null; it._traceImg=null; render(); }
 function setPoseSrc(i,s){ collect(i); ST.items[i].poseSrc=s; render(); }
 function resetPose(i){ ST.items[i].joints=defaultPose(); drawPose(i); }
 function drawPose(i){
@@ -5222,6 +6028,9 @@ function drawPose(i){
   if(!it.joints) it.joints=defaultPose();
   const c=cv.getContext('2d');
   c.fillStyle='#000'; c.fillRect(0,0,cv.width,cv.height);
+  if(it.poseSrc==='trace'&&it._traceImg){ // 描图模式: 照片压暗垫底,骨架画在上面照着摆
+    c.globalAlpha=0.45; c.drawImage(it._traceImg,0,0,cv.width,cv.height); c.globalAlpha=1;
+  }
   const lw=Math.max(3,cv.width/110), jr=lw*0.9;
   const pts=it.joints.map(p=>[p[0]*cv.width,p[1]*cv.height]);
   c.lineCap='round';
@@ -5234,6 +6043,10 @@ function initPoseCanvas(i){
   if(!it.joints) it.joints=defaultPose();
   const sc=Math.min(1, 780/it.w);
   cv.width=Math.round(it.w*sc); cv.height=Math.round(it.h*sc);
+  if(it.poseSrc==='trace'&&it.traceFile&&!it._traceImg){
+    const img=new Image(); img.onload=()=>{ it._traceImg=img; drawPose(i); };
+    img.src=URL.createObjectURL(it.traceFile);
+  }
   drawPose(i);
   let drag=-1;
   const loc=e=>{ const r=cv.getBoundingClientRect();
@@ -5257,42 +6070,206 @@ function exportPose(i){ // 按出图分辨率导出黑底骨架 PNG
     c.beginPath(); c.moveTo(pts[b[0]][0],pts[b[0]][1]); c.lineTo(pts[b[1]][0],pts[b[1]][1]); c.stroke(); });
   return new Promise(res=>off.toBlob(res,'image/png'));
 }
+// 姿势玩法的完整设置块: 三种骨架来源 + 预设 + 严格模式 + 同人多姿势
+function poseBlock(i){
+  const it=ST.items[i];
+  const srcRow=`<label>骨架从哪来</label><div class="row">
+    <label style="margin:0"><input type="radio" name="psrc${i}" ${it.poseSrc==='draw'?'checked':''} onchange="setPoseSrc(${i},'draw')"> 摆火柴人</label>
+    <label style="margin:0"><input type="radio" name="psrc${i}" ${it.poseSrc==='trace'?'checked':''} onchange="setPoseSrc(${i},'trace')"> 照着照片摆</label>
+    <label style="margin:0"><input type="radio" name="psrc${i}" ${it.poseSrc==='upload'?'checked':''} onchange="setPoseSrc(${i},'upload')"> 上传骨架/线稿图</label></div>`;
+  let body='';
+  if(it.poseSrc==='draw'||it.poseSrc==='trace'){
+    body=`<div class="row" style="flex-wrap:wrap">
+        <span><label style="margin:0 6px 0 0">姿势预设</label><select onchange="posePreset(${i},this.value)">
+          <option value="">选一个预设再微调…</option>${Object.keys(POSE_PRESETS).map(k=>`<option value="${k}">${POSE_PRESETS[k][0]}</option>`).join('')}</select></span>
+        <button class="back" style="padding:4px 12px;font-size:13px" onclick="resetPose(${i})">重置</button>
+        <button class="back" style="padding:4px 12px;font-size:13px" title="复制这张卡片:同一套参数/同一张锁脸图,换个姿势——一个人多种姿势就这么来" onclick="dupItem(${i})">➕ 复制此卡换姿势</button></div>
+      ${it.poseSrc==='trace'?`<div class="row" style="margin-top:6px;align-items:center">
+        <button type="button" class="back" style="padding:4px 12px;font-size:13px" onclick="$('#trace${i}').click()">${it.traceFile?'✔ '+esc(it.traceFile.name)+'(点我换一张)':'上传要模仿的照片'}</button>
+        <input type="file" id="trace${i}" accept="image/*" style="display:none" onchange="tracePick(${i},this)">
+        <span class="small">照片会压暗垫在骨架底下当描图底,把圆点拖到照片人物的关节上</span></div>
+        ${it.traceFile?'':'<div class="small" style="color:#b54708">还没上传照片;不上传也可以直接摆(等同于摆火柴人)。</div>'}`:''}
+      <canvas id="pcanvas${i}" style="max-width:100%;border-radius:8px;border:1px dashed #bbb;cursor:grab;touch-action:none;background:#000"></canvas>
+      <div class="small">实际发给 AI 的是<b>黑底彩条骨架</b>(不会带上你的照片/底图)。同一个人多种姿势:开「人物一致性」锁脸 + 点「复制此卡换姿势」,每张卡摆一个姿势一起生成。</div>`
+      +sizeRow(i,it);
+  }else{
+    body=refRow(i,'上传骨架图(黑底彩色火柴人)或线稿图')+sizeRow(i,it)+
+      `<label>控制类型</label><select id="ctype${i}"><option value="openpose" ${it.ctype==='openpose'?'selected':''}>骨架图(openpose)</option><option value="hed/pidi/scribble/ted" ${it.ctype==='hed/pidi/scribble/ted'?'selected':''}>涂鸦/线稿(scribble)</option></select>`;
+  }
+  body+=`<label style="margin-top:8px"><input type="checkbox" ${it.poseStrict?'checked':''} onchange="collect(${i});ST.items[${i}].poseStrict=this.checked;render()"> <b>严格按姿势来</b></label>
+    <div class="small">${it.poseStrict?'全程满强度照骨架画,姿势最准;脸/衣服细节交给提示词。':'不严格:用滑杆控制力度,后半程 AI 自由发挥——构图更自然,但可能不完全跟姿势。'}</div>
+    ${it.poseStrict?'':strRow(i,'控制强度','越大越照骨架来')}`;
+  return srcRow+body;
+}
+// ---- 功能能力判断: 什么模型能用什么玩法,不能用的置灰并写清原因 ----
+function capsOK(){ return ST.caps && typeof ST.caps==='object'; }
+function modeOptsFor(i){
+  const it=ST.items[i]; const caps=ST.caps||{};
+  const o=(v,label,ok,why)=>`<option value="${v}" ${it.mode===v?'selected':''} ${ok?'':'disabled'}>${label}${ok?'':' · 不可用'}</option>`;
+  if(ST.q21){
+    return o('t2i','普通文生图',true)
+      + o('edit','图像编辑(说哪改哪·Qwen原生)',!ST.turbo,'极速版是6步蒸馏模型,不支持编辑')
+      + `<option disabled>以图生图 · Qwen请用图像编辑</option>`
+      + `<option disabled>局部重绘 · Qwen请用图像编辑</option>`
+      + `<option disabled>扩图 · Qwen请用图像编辑描述扩展</option>`
+      + `<option disabled>放大/修复 · Qwen请用图像编辑</option>`
+      + `<option disabled>姿势控制 · 仅SDXL单文件模型</option>`;
+  }
+  const sd3=ST.kind==='sd3', ck=ST.kind==='checkpoint';
+  const hasCN=caps.has_cn||ST.hasCN;
+  return o('t2i','普通文生图',true)
+    + o('i2i','以图生图(参考画风)',true)
+    + o('inpaint','局部重绘(涂哪改哪)',!sd3,'SD3.5 不支持局部重绘')
+    + o('outpaint','扩图(四周边外延伸)',!sd3,'SD3.5 不支持扩图')
+    + o('upscale','放大变清晰',!sd3,'SD3.5 不支持放大重绘')
+    + o('restore','画质增强/老照片修复',!sd3,'SD3.5 不支持修复')
+    + o('pose','姿势控制(骨架/线稿)',ck&&hasCN, ck?'需要 models/image/controlnet/ 里有 ControlNet':'仅 SDXL 单文件模型(如 wai)');
+}
+// 构图选择(镜头语言,拼提示词前缀;文生图/图生图/姿势可用,改图类画面已由原图决定故不出现在那些玩法)
+const COMP_OPTS=[['','默认(不指定镜头)'],['closeup','特写(脸部为主)'],['upper','半身像(腰以上)'],['full','全身像(头到脚)'],['wide','远景·大场景'],['topdown','俯视(从上往下)'],['lookup','仰视(从下往上)'],['dutch','倾斜角(动感)'],['side','侧面像'],['back','背影']];
+function compRow(i){
+  const it=ST.items[i];
+  return `<label>构图(镜头语言,自动加进提示词最前面)</label><select id="comp${i}" onchange="collect(${i})">
+    ${COMP_OPTS.map(c=>`<option value="${c[0]}" ${it.composition===c[0]?'selected':''}>${c[1]}</option>`).join('')}</select>
+    <div class="small">构图管镜头远近/角度;姿势控制管人物动作——两者可串联:先选构图再摆骨架。</div>`;
+}
+// 人物一致性(锁脸/锁形象 + FaceID 高级锁五官)
+function faceRow(i){
+  const it=ST.items[i]; const caps=ST.caps||{};
+  const head=`<b>🧑 人物一致性(锁脸/锁形象)</b> <span class="small" title="给一张人脸参考图,生成的人物长相跟着它;姿势/构图仍由提示词和骨架控制,可互相串联">ⓘ 说明</span>`;
+  if(!(ST.kind==='checkpoint'||ST.sdxlClip))
+    return `<div class="box" style="padding:8px 12px;opacity:.75">${head}<div class="small">当前模型架构不支持(需要 SDXL 系:单文件模型或 janku)。</div></div>`;
+  if(!caps.has_ipa)
+    return `<div class="box" style="padding:8px 12px;opacity:.75">${head}<div class="small">缺 IPAdapter 模型:把 ip-adapter-plus-face 放 models/image/ipadapter/、CLIP-ViT-H 放 models/image/clip_vision/ 后重启生图服务。</div></div>`;
+  if(!it.faceLock)
+    return `<div class="box" style="padding:8px 12px">${head}
+      <label style="margin:6px 0 0"><input type="checkbox" onchange="collect(${i});ST.items[${i}].faceLock=this.checked;render()"> 开启锁脸(给一张人脸参考图)</label>
+      <div class="small">适合「同一个人多张图/多种姿势」:锁住长相,姿势用骨架、构图用上面构图栏,各司其职。</div></div>`;
+  const fidOk=caps.faceid_ready, fidMiss=(caps.faceid_missing||[]).join('；');
+  return `<div class="box" style="padding:8px 12px">${head}
+    <label style="margin:6px 0 0"><input type="checkbox" checked onchange="collect(${i});ST.items[${i}].faceLock=this.checked;render()"> 已开启(取消勾选即关)</label>
+    <div class="row" style="margin-top:8px;align-items:center">
+      <button type="button" class="back" style="padding:4px 12px;font-size:13px" onclick="$('#ipa${i}').click()">${it.ipaFile?'✔ '+esc(it.ipaFile.name):'上传人脸参考图(大头照/半身照最稳)'}</button>
+      <input type="file" id="ipa${i}" accept="image/*" style="display:none" onchange="collect(${i});ST.items[${i}].ipaFile=this.files[0]||null;render()">
+      ${it.ipaFile?`<img src="${URL.createObjectURL(it.ipaFile)}" style="width:56px;height:56px;object-fit:cover;border-radius:8px">`:''}</div>
+    <div class="row" style="margin-top:6px"><span style="font-size:13px">锁脸力度 <b id="ipaWv${i}">${it.ipaWeight.toFixed(2)}</b></span>
+      <input type="range" min="0.2" max="0.5" step="0.05" value="${it.ipaWeight}" style="flex:1"
+        oninput="ST.items[${i}].ipaWeight=+this.value;$('#ipaWv${i}').textContent=(+this.value).toFixed(2)">
+      <span class="small">0.3 最稳;≥0.4 易出杂纹</span></div>
+    <div class="row" style="margin-top:4px"><span style="font-size:13px">生效终点 <b id="ipaEv${i}">${it.ipaEnd.toFixed(2)}</b></span>
+      <input type="range" min="0.5" max="1.0" step="0.05" value="${it.ipaEnd}" style="flex:1"
+        oninput="ST.items[${i}].ipaEnd=+this.value;$('#ipaEv${i}').textContent=(+this.value).toFixed(2)">
+      <span class="small">锁脸和构图打架时调小到 0.7~0.8:前半程定脸,后半程自由构图</span></div>
+    <label style="margin-top:8px"><input type="checkbox" ${it.faceid?'checked':''} ${fidOk?'':'disabled'} onchange="collect(${i});ST.items[${i}].faceid=this.checked"> <b>高级·锁五官(FaceID)</b> <span class="small">换姿势/换发型脸也不变,比普通锁脸更准</span></label>
+    ${fidOk?'':'<div class="small" style="color:#b54708">FaceID 文件不齐,暂不可用:'+esc(fidMiss)+'</div>'}
+  </div>`;
+}
+// LoRA/LyCORIS 补丁(统一目录 models/image/loras,管理页勾选启用)
+// 拆成 外壳(loraRow) + 内容(loraInner): 勾选时只重绘这一个盒子,不碰整页,避免屏幕闪烁/图片重载
+function loraInner(i){
+  const it=ST.items[i]; const caps=ST.caps||{};
+  const head=`<b>🧩 LoRA/LyCORIS 补丁</b> <button type="button" class="back" style="padding:2px 10px;font-size:12px" onclick="event.stopPropagation();goStep(95)">管理/启用</button>
+    <span class="small" title="画风/人物/服装小补丁,可叠多个、各调强度;叠越多越容易互相干扰">ⓘ 说明</span>`;
+  if(ST.kind==='sd3') return `${head}<div class="small">SD3.5 Medium 暂不支持 LoRA 叠加。</div>`;
+  const list=(caps.loras||[]).filter(l=>l.enabled);
+  if(!list.length) return `${head}<div class="small">没有已启用的补丁。把 .safetensors 放进 <code>models/image/loras/</code>,再点「管理/启用」勾选(支持 LyCORIS 格式)。</div>`;
+  return `${head}
+    <div id="lorabox${i}" style="${list.length>10?'max-height:340px;overflow-y:auto;padding-right:4px':''}">
+    ${list.map(l=>{const cur=it.loras.find(x=>x.name===l.name);return `<div class="row" style="margin-top:6px;flex-wrap:nowrap">
+      <label style="margin:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(l.name)}"><input type="checkbox" ${cur?'checked':''} onchange="loraToggle(${i},'${esc(l.name)}',this.checked)"> ${esc(l.name)}</label>
+      ${cur?`<input type="range" min="0.2" max="1.5" step="0.1" value="${cur.strength}" style="width:110px" title="强度:这个补丁管多严。0.2~0.4 轻微,0.8 默认最稳,1.2 以上容易变脸" oninput="loraStr(${i},'${esc(l.name)}',+this.value);this.nextElementSibling.textContent=(+this.value).toFixed(1)"><b style="font-size:12px;width:30px">${cur.strength.toFixed(1)}</b>`:''}
+    </div>${l.desc?`<div class="small" style="margin:0 0 4px 22px;line-height:1.5">${esc(l.desc)}</div>`:''}`;}).join('')}
+    </div>
+    <div class="small" style="margin-top:4px">最多生效前 3 个;右侧滑块=强度(补丁管多严:0.2~0.4 轻微点缀,0.8 左右最稳,1.2 以上容易过拟合变脸)。</div>`;
+}
+function loraRow(i){
+  if(ST.kind==='sd3') return `<div class="box" style="padding:8px 12px;opacity:.75">${loraInner(i)}</div>`;
+  return `<div class="box" style="padding:8px 12px" id="lorawrap${i}">${loraInner(i)}</div>`;
+}
+// 通用选项: 加速 + 脸部修复(所有玩法可叠加)
+function optRow(i){
+  const it=ST.items[i]; const caps=ST.caps||{};
+  const hasFF=(caps.facefix_models||[]).length>0;
+  return `<div class="box" style="padding:8px 12px"><b>⚙️ 通用选项</b>
+    <label style="margin:6px 0 0"><input type="checkbox" ${it.fast?'checked':''} ${ST.turbo?'disabled':''} onchange="collect(${i});ST.items[${i}].fast=this.checked"> <b>⚡ 加速</b></label>
+    ${ST.turbo?'<div class="small" style="color:#b54708">⛔ 为什么选不了：当前模型本身就是「6 步极速版」，已经是最快档位，加速开关对它没有任何效果，所以禁用。想加速请切换到「高质量·无审查」或其他模型。</div>':'<div class="small">勾选后采样步数减约 45%,出图快近一倍;<b>代价:细节变少、稳定性略降,复杂构图/多人更容易崩</b>。赶时间草稿用,成品建议关。</div>'}
+    <label style="margin:8px 0 0"><input type="checkbox" ${it.facefix?'checked':''} ${hasFF?'':'disabled'} onchange="collect(${i});ST.items[${i}].facefix=this.checked"> <b>🛠 脸部修复</b> <span class="small">出图后自动检测小脸/崩脸单独重画一遍,治"脸崩";多人图每张脸都会修</span></label>
+    ${hasFF?'':'<div class="small" style="color:#b54708">需要修复模型:把 GFPGANv1.4.pth 放进 models/image/facerestore/ 后重启生图服务即可勾选。</div>'}
+  </div>`;
+}
+function loraToggle(i,name,on){ collect(i); const l=ST.items[i].loras; const k=l.findIndex(x=>x.name===name);
+  if(on&&k<0) l.push({name,strength:0.8}); if(!on&&k>=0) l.splice(k,1);
+  const lb=document.getElementById('lorabox'+i), lst=lb?lb.scrollTop:null;   // 记住列表滚动位置
+  const w=document.getElementById('lorawrap'+i);
+  if(w){ w.innerHTML=loraInner(i); const lb2=document.getElementById('lorabox'+i); if(lb2&&lst!=null) lb2.scrollTop=lst; }  // 只重绘LoRA盒子,整页不动
+  else render(); }
+function loraStr(i,name,v){ const l=ST.items[i].loras.find(x=>x.name===name); if(l) l.strength=v; }
+// 功能搭配速查表: 每个功能是干什么的、能跟什么串联、不能跟什么用
+function featGuideHtml(){
+  const R=(name,desc,withOk,withNo)=>`<tr><td style="white-space:nowrap"><b>${name}</b></td><td>${desc}</td><td>${withOk}</td><td>${withNo}</td></tr>`;
+  return `<details class="box" style="padding:8px 12px"><summary style="cursor:pointer"><b>📖 功能搭配速查</b> <span class="small">每个功能是干什么的 / 能不能一起用,点开看</span></summary>
+    <div style="overflow-x:auto;margin-top:8px"><table style="border-collapse:collapse;font-size:12.5px;line-height:1.6;width:100%">
+    <tr style="text-align:left;color:var(--muted)"><th style="padding:4px 8px">功能</th><th style="padding:4px 8px">干什么用</th><th style="padding:4px 8px">✅ 可串联</th><th style="padding:4px 8px">⛔ 不可同用</th></tr>
+    ${R('文生图','纯文字出图,一切的基础玩法','构图/锁脸/LoRA/加速/修脸','—')}
+    ${R('以图生图','整图按画风重绘,保留构图换内容','构图/锁脸/LoRA/加速/修脸','局部重绘/扩图(同一张卡二选一)')}
+    ${R('图像编辑','Qwen 原生:上传图+说哪改哪','修脸','锁脸/LoRA以外的控制类(模型自己理解)')}
+    ${R('局部重绘','涂/圈/点选哪改哪,其余原样保留','锁脸/LoRA/加速/修脸/羽化','构图(画面已由原图决定)')}
+    ${R('扩图','往原图四周继续画,竖图变横图','LoRA/加速/修脸','构图/姿势(内容由原图延伸)')}
+    ${R('姿势控制','火柴人骨架定动作,拖动圆点摆姿势','构图(先选镜头再摆骨架)/锁脸(同人多姿势)/LoRA/修脸','以图生图/局部重绘(骨架和垫图只能二选一)')}
+    ${R('锁脸/锁形象','给张人脸照,生成的人物长相跟着它','姿势/构图/LoRA(同一个人多种姿势)','图像编辑(Qwen 自己读图)')}
+    ${R('高级·锁五官','FaceID:换姿势换发型脸也不变','同锁脸','—(需补齐 FaceID 三件套才亮)')}
+    ${R('脸部修复','出图后自动检测崩脸单独重画','所有玩法都可叠加的后处理','—(需 GFPGAN 模型才亮)')}
+    ${R('画质增强','老照片/小糊图:放大+低幅度重绘补细节','脸部修复(修老照片人像必勾)/加速','构图/锁脸(原图内容不变)')}
+    ${R('LoRA 补丁','画风/人物/服装小补丁,可叠 3 个各调强度','几乎所有玩法','SD3.5 模型')}
+    ${R('加速','采样步数砍半,快近一倍','所有玩法','极速版模型(已经是最快)')}
+    </table></div>
+    <div class="small" style="margin-top:6px">一句话记忆:<b>玩法选一个</b>(卡片顶部下拉),<b>增强随便叠</b>(构图/锁脸/LoRA/加速/修脸都是叠加层)。灰掉的选项 = 当前模型不支持,悬停看原因。</div></details>`;
+}
 function cardHTML(i){
   const it=ST.items[i];
+  if(ST.q21 && it.mode!=='t2i' && it.mode!=='edit') it.mode='t2i';  // Qwen-Image-2.1 只有文生图/原生编辑两种玩法
+  if(ST.kind==='sd3' && ['inpaint','outpaint','upscale','restore','pose'].includes(it.mode)) it.mode='t2i';
+  if(it.mode==='pose' && !(ST.kind==='checkpoint' && ((ST.caps||{}).has_cn||ST.hasCN))) it.mode='t2i';
   let mid='';
   if(it.mode==='t2i') mid=sizeRow(i,it);
-  if(it.mode==='i2i') mid=refRow(i,'上传参考图:保持画风构图,按提示词改内容(尺寸跟随参考图)')+strRow(i,'重绘幅度','小=更像原图,大=变化更大');
+  if(it.mode==='i2i') mid=refRow(i,'上传参考图:保持画风构图,按提示词改内容(尺寸跟随参考图)')+strRow(i,'重绘幅度','小=更像原图,大=变化更大;换风格 0.6~0.75,微调 0.3~0.45');
+  if(it.mode==='edit') mid=refRow(i,'上传要编辑的原图,提示词写想把图改成什么样(尺寸/构图跟随原图)');
   if(it.mode==='inpaint') mid=refRow(i,'上传要修改的原图(尺寸跟随原图)')+maskRow(i);
+  if(it.mode==='outpaint') mid=refRow(i,'上传要扩的原图')+
+    `<label>四个方向各扩多少像素(不需要的方向填 0)</label><div class="row" style="flex-wrap:wrap">
+      <span>左 <input type="number" id="padl${i}" value="${it.pad.l}" min="0" max="2048" step="64" style="width:76px" onchange="collect(${i})"></span>
+      <span>上 <input type="number" id="padt${i}" value="${it.pad.t}" min="0" max="2048" step="64" style="width:76px" onchange="collect(${i})"></span>
+      <span>右 <input type="number" id="padr${i}" value="${it.pad.r}" min="0" max="2048" step="64" style="width:76px" onchange="collect(${i})"></span>
+      <span>下 <input type="number" id="padb${i}" value="${it.pad.b}" min="0" max="2048" step="64" style="width:76px" onchange="collect(${i})"></span></div>
+    <div class="small">例:竖图变横图 → 左 512、右 512;扩出来的内容由提示词描述。每次扩 256~512 最稳,一次扩太多容易糊。</div>`;
   if(it.mode==='upscale') mid=refRow(i,'上传要放大的图')+
     `<label>放大倍数</label><select id="scale${i}"><option value="1.5" ${it.scale===1.5?'selected':''}>1.5 倍</option><option value="2" ${it.scale===2?'selected':''}>2 倍</option></select>`+
     strRow(i,'重绘幅度','建议0.3~0.5,太大细节会变样');
-  if(it.mode==='pose'){
-    const srcRow=`<label>骨架从哪来</label><div class="row">
-      <label style="margin:0"><input type="radio" name="psrc${i}" ${it.poseSrc==='draw'?'checked':''} onchange="setPoseSrc(${i},'draw')"> 摆火柴人(推荐)</label>
-      <label style="margin:0"><input type="radio" name="psrc${i}" ${it.poseSrc!=='draw'?'checked':''} onchange="setPoseSrc(${i},'upload')"> 上传骨架/线稿图</label></div>`;
-    if(it.poseSrc==='draw'){
-      mid=srcRow+
-        `<div class="row"><button class="back" style="padding:4px 12px;font-size:13px" onclick="resetPose(${i})">重置姿势</button>
-         <span class="small">拖动圆点摆姿势,黑底彩条就是给 AI 的骨架,不用上传</span></div>
-         <canvas id="pcanvas${i}" style="max-width:100%;border-radius:8px;border:1px dashed #bbb;cursor:grab;touch-action:none;background:#000"></canvas>`+
-        sizeRow(i,it)+strRow(i,'控制强度','越大越严格照骨架来');
-    }else{
-      mid=srcRow+refRow(i,'上传骨架图(黑底彩色火柴人)或线稿图')+sizeRow(i,it)+
-        `<label>控制类型</label><select id="ctype${i}"><option value="openpose" ${it.ctype==='openpose'?'selected':''}>骨架图(openpose)</option><option value="hed/pidi/scribble/ted" ${it.ctype==='hed/pidi/scribble/ted'?'selected':''}>涂鸦/线稿(scribble)</option></select>`+
-        strRow(i,'控制强度','越大越严格照图来');
-    }
+  if(it.mode==='restore'){ // 画质增强/老照片修复
+    const ups=(ST.caps||{}).upscale_models||[];
+    mid=refRow(i,'上传要修复/增强的图(老照片、小图、糊图)')+
+      `<label>放大方式</label><select id="upmodel${i}" onchange="collect(${i})">
+        <option value="" ${!it.upmodel?'selected':''}>普通拉伸放大(无需模型)</option>
+        ${ups.map(u=>`<option value="${esc(u)}" ${it.upmodel===u?'selected':''}>算法放大:${esc(u)}</option>`).join('')}</select>
+      ${ups.length?'':'<div class="small">把 Real-ESRGAN 等放大模型(.pth)放进 models/image/upscale_models/ 并重启生图服务,这里就能选「算法放大」,细节明显更好。</div>'}`+
+      (it.upmodel?'':`<label>放大倍数</label><select id="scale${i}"><option value="1.5" ${it.scale===1.5?'selected':''}>1.5 倍</option><option value="2" ${it.scale===2?'selected':''}>2 倍</option><option value="3" ${it.scale===3?'selected':''}>3 倍</option></select>`)+
+      strRow(i,'修复强度','0.25~0.4 保原貌补细节;老照片划痕多可到 0.5;再大就换脸了')+
+      `<div class="small">💡 修人脸老照片:顺手勾上下面「通用选项 → 脸部修复」,划痕重绘 + 五官精修一起来。</div>`;
   }
-  const posLabel={inpaint:'正向提示词:涂抹区域里要画什么(可留空)',upscale:'正向提示词(可留空)',pose:'正向提示词:想要什么画面(可留空)'}[it.mode]||'正向提示词:想要什么画面(可留空)';
+  if(it.mode==='pose') mid=poseBlock(i);
+  const posLabel={inpaint:'正向提示词:涂抹区域里要画什么(可留空)',upscale:'正向提示词(可留空)',restore:'正向提示词:修复后期望的画面质感(可留空)',outpaint:'正向提示词:扩出来的区域画什么(可留空)',pose:'正向提示词:想要什么画面(可留空)',edit:'正向提示词:想把这张图改成什么样(可留空)'}[it.mode]||'正向提示词:想要什么画面(可留空)';
+  // 功能串联: 构图/锁脸/LoRA/加速/修脸是"叠加层",与玩法自由组合;改图类玩法不叠加构图
+  const canComp=['t2i','i2i','pose'].includes(it.mode);
+  const canFace=['t2i','i2i','inpaint','pose'].includes(it.mode);
+  const canLora=true; // checkpoint 连 CLIP 一起调;GGUF(含 Qwen)只接 unet,都能叠 LoRA;sd3 在 loraRow 里单独置灰
   return `<div class="card" style="cursor:default">${it.resultUrl?`<img class="cardthumb" src="${it.resultUrl}" title="上次生成的图">`:''}<b>第 ${i+1} 张</b>${ST.items.length>1?`<span class="delcard" onclick="delCard(${i})" title="删掉这张">✕</span>`:''}
-    <label>玩法</label><select id="mode${i}" onchange="setMode(${i})">
-      <option value="t2i" ${it.mode==='t2i'?'selected':''}>普通文生图</option>
-      <option value="i2i" ${it.mode==='i2i'?'selected':''}>以图生图(参考画风)</option>
-      <option value="inpaint" ${it.mode==='inpaint'?'selected':''}>局部重绘(涂哪改哪)</option>
-      <option value="upscale" ${it.mode==='upscale'?'selected':''}>放大变清晰</option>
-      ${(ST.kind==='checkpoint'&&ST.hasCN)?`<option value="pose" ${it.mode==='pose'?'selected':''}>姿势控制(骨架/线稿)</option>`:''}
-    </select>${mid}
+    <label>玩法 <span class="small">(灰色的 = 当前模型不支持,鼠标悬停看原因)</span></label><select id="mode${i}" onchange="setMode(${i})">${modeOptsFor(i)}</select>${mid}
+    ${canComp?compRow(i):''}
+    ${canFace?faceRow(i):''}
+    ${canLora?loraRow(i):''}
+    ${optRow(i)}
     <label>默认提示词(质量词,自动加在最前面,可改可清空)</label><textarea id="defpos${i}" style="height:38px">${it.defPos}</textarea>
-    <label>${posLabel} — 点下面标签快速加</label>${tagRow(i,POS_TAGS,'pos')}<textarea id="pos${i}" placeholder="不填也行,比如: a cat, 1girl, school uniform">${it.pos}</textarea>
+    <label>${posLabel} — 点下面标签快速加</label>${tagRow(i,POS_TAGS,'pos')}<textarea id="pos${i}" placeholder="不填也行,比如: a cat, 1girl, school uniform;想加重视某个词就写 (红色裙子:1.3)">${it.pos}</textarea>
     <label>负向提示词:不想要什么(可留空,有默认值) — 点下面标签快速加</label>${tagRow(i,NEG_TAGS,'neg')}<textarea id="neg${i}">${it.neg}</textarea></div>`;
 }
 function sizeSel(i, sel){
@@ -5318,15 +6295,18 @@ async function startGen(){
     it.pos=dp?(up?dp+', '+up:dp):up;
     if(!it.pos) it.pos='masterpiece, best quality';
     if(!it.neg.trim()) it.neg=NEG_DEF;
-    if(it.mode!=='t2i' && !(it.mode==='pose'&&it.poseSrc==='draw') && !it.refFile){ cAlert('第 '+(i+1)+' 张还没上传图片!'); return; }
-    if(it.mode==='inpaint' && !it.strokes.length){ cAlert('第 '+(i+1)+' 张还没涂抹要重画的区域!'); return; }
+    if(it.mode!=='t2i' && !(it.mode==='pose'&&it.poseSrc!=='upload') && !it.refFile){ cAlert('第 '+(i+1)+' 张还没上传图片!'); return; }
+    if(it.mode==='inpaint' && !it._maskDirty){ cAlert('第 '+(i+1)+' 张还没选择要重画的区域(画笔/套索/魔术棒都行)!'); return; }
+    if(it.mode==='outpaint' && !(it.pad.l||it.pad.t||it.pad.r||it.pad.b)){ cAlert('第 '+(i+1)+' 张扩图还没填扩出像素:左/上/右/下至少一个 >0'); return; }
+    if(it.faceLock && !it.ipaFile){ cAlert('第 '+(i+1)+' 张开了锁脸但还没上传人脸参考图!'); return; }
     try{
-      it.ref=null; it.mask=null;
-      if(it.mode==='pose'&&it.poseSrc==='draw'){
+      it.ref=null; it.mask=null; it.ipa=null;
+      if(it.mode==='pose'&&it.poseSrc!=='upload'){
         it.ctype='openpose';
         const blob=await exportPose(i); it.ref=await uploadFile(blob,'pose-'+Date.now()+'-'+i+'.png');
       }else if(it.mode!=='t2i') it.ref=await uploadFile(it.refFile);
       if(it.mode==='inpaint'){ const blob=await exportMask(i); it.mask=await uploadFile(blob,'mask-'+Date.now()+'-'+i+'.png'); }
+      if(it.faceLock&&it.ipaFile) it.ipa=await uploadFile(it.ipaFile,'face-'+Date.now()+'-'+i+'.png');
     }catch(e){ cAlert('第 '+(i+1)+' 张: '+e.message); return; }
   }
   ST.pids=[];
@@ -5335,7 +6315,10 @@ async function startGen(){
     const name=`img-${Date.now()}-${String(i+1).padStart(2,'0')}`;
     const r=await j('/api/gen',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({model:ST.model,mode:it.mode,pos:it.pos,neg:it.neg,w:it.w,h:it.h,name,
-        ref:it.ref,mask:it.mask,strength:it.strength,scale:it.scale,ctype:it.ctype})});
+        ref:it.ref,mask:it.mask,strength:it.strength,scale:it.scale,ctype:it.ctype,
+        ipa:it.ipa,ipa_weight:it.ipaWeight,ipa_end:it.ipaEnd,faceid:it.faceid,
+        composition:it.composition,loras:it.loras,fast:it.fast,facefix:it.facefix,
+        pose_strict:it.poseStrict,mask_blur:it.feather,pad:it.pad,upscale_model:it.upmodel})});
     if(r.error){ cAlert('提交失败: '+r.error); return; }
     ST.pids.push(r.pid);
   }
@@ -5410,17 +6393,21 @@ async function regenOne(i){ // 只重生成第 i 张(同尺寸同模式,只换�
   if(!it.pos) it.pos='masterpiece, best quality';
   if(!it.neg) it.neg=NEG_DEF;
   try{
-    it.ref=null; it.mask=null;
-    if(it.mode==='pose'&&it.poseSrc==='draw'){
+    it.ref=null; it.mask=null; it.ipa=null;
+    if(it.mode==='pose'&&it.poseSrc!=='upload'){
       it.ctype='openpose';
       const blob=await exportPose(i); it.ref=await uploadFile(blob,'pose-'+Date.now()+'-'+i+'.png');
     }else if(it.mode!=='t2i'&&it.refFile) it.ref=await uploadFile(it.refFile);
-    if(it.mode==='inpaint'&&it.strokes.length){ const blob=await exportMask(i); it.mask=await uploadFile(blob,'mask-'+Date.now()+'-'+i+'.png'); }
+    if(it.mode==='inpaint'&&it._maskDirty){ const blob=await exportMask(i); it.mask=await uploadFile(blob,'mask-'+Date.now()+'-'+i+'.png'); }
+    if(it.faceLock&&it.ipaFile) it.ipa=await uploadFile(it.ipaFile,'face-'+Date.now()+'-'+i+'.png');
   }catch(e){ cAlert('第 '+(i+1)+' 张: '+e.message); return; }
   const name=`img-${Date.now()}-${String(i+1).padStart(2,'0')}`;
   const r=await j('/api/gen',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({model:ST.model,mode:it.mode,pos:it.pos,neg:it.neg,w:it.w,h:it.h,name,
-      ref:it.ref,mask:it.mask,strength:it.strength,scale:it.scale,ctype:it.ctype})});
+      ref:it.ref,mask:it.mask,strength:it.strength,scale:it.scale,ctype:it.ctype,
+      ipa:it.ipa,ipa_weight:it.ipaWeight,ipa_end:it.ipaEnd,faceid:it.faceid,
+      composition:it.composition,loras:it.loras,fast:it.fast,facefix:it.facefix,
+      pose_strict:it.poseStrict,mask_blur:it.feather,pad:it.pad,upscale_model:it.upmodel})});
   if(r.error){ cAlert('提交失败: '+r.error); return; }
   $('#pe'+i).innerHTML=''; $('#acts'+i).style.display='none'; $('#img'+i).innerHTML='';
   $('#b'+i).style.width='0%'; $('#st'+i).textContent='排队中…';
@@ -5569,6 +6556,14 @@ class H(BaseHTTPRequestHandler):
             }))
         elif self.path == "/api/models":
             self._send(200, json.dumps(list_models()))
+        elif self.path == "/api/caps":
+            self._send(200, json.dumps(capabilities()))
+        elif self.path == "/api/loras":
+            self._send(200, json.dumps({"loras": list_loras(), "dir": MODELS_LORA}))
+        elif self.path == "/api/memlock":
+            self._send(200, json.dumps(svc.mem_lock_conf()))
+        elif self.path == "/api/style":
+            self._send(200, json.dumps(style_conf()))
         elif self.path == "/api/start":
             self._send(200, json.dumps(start_comfy()))
         elif self.path == "/api/svc/state":
@@ -5664,7 +6659,13 @@ class H(BaseHTTPRequestHandler):
             pid = self.path.split("pid=")[-1]
             with LOCK: t = TASKS.get(pid)
             if not t:
-                self._send(404, json.dumps({"error": "未知任务"}))
+                # 兜底: 控制台重启后 TASKS 丢失,但 ComfyUI 里的任务还在跑/已完成。
+                # 直接问 ComfyUI 要状态: 排队→照实返回; 完成→收集产物返回 done; 失败→返回 error。
+                fb = _poll_recover(pid)
+                if fb is None:
+                    self._send(404, json.dumps({"error": "未知任务"}))
+                else:
+                    self._send(200, json.dumps(fb))
             elif t["done"] or t["error"]:
                 self._send(200, json.dumps({"done": t["done"], "error": t["error"], "url": t["url"]}))
             else:
@@ -5721,17 +6722,47 @@ class H(BaseHTTPRequestHandler):
         else:
             self._send(404, "{}")
     def do_POST(self):
-        if self.path == "/api/gen":
+        if self.path == "/api/memlock":
             try:
                 d = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                self._send(200, json.dumps(svc.set_mem_lock(d.get("enabled", False),
+                                                           d.get("gb", 25),
+                                                           bool(d.get("apply", True)))))
+            except Exception as e:
+                self._send(200, json.dumps({"ok": False, "error": str(e)}))
+        elif self.path == "/api/style":
+            try:
+                d = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                self._send(200, json.dumps(set_style(str(d.get("style", "free")))))
+            except Exception as e:
+                self._send(200, json.dumps({"ok": False, "error": str(e)}))
+        elif self.path == "/api/memfree":
+            try:
+                d = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                self._send(200, json.dumps(svc.mem_free(bool(d.get("apps", False)))))
+            except Exception as e:
+                self._send(200, json.dumps({"ok": False, "error": str(e)}))
+        elif self.path == "/api/gen":
+            try:
+                d = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                opts = {k: d.get(k) for k in (
+                    "composition", "loras", "fast", "faceid", "ipa_end", "facefix",
+                    "facefix_weight", "pose_strict", "mask_grow", "mask_blur",
+                    "mask_invert", "pad", "feather", "upscale_model") if d.get(k) is not None}
                 pid = submit(d["model"], d["pos"], d["neg"], int(d["w"]), int(d["h"]), d["name"],
                              d.get("mode", "t2i"), d.get("ref"), d.get("mask"),
                              float(d.get("strength", 0.6)), float(d.get("scale", 2.0)), d.get("ctype", "openpose"),
                              d.get("ipa"), float(d.get("ipa_weight", 0.3)), int(d.get("batch", 1)),
-                             int(d.get("timeout", 1800)), d.get("archive"))
+                             int(d.get("timeout", 1800)), d.get("archive"), opts)
                 self._send(200, json.dumps({"pid": pid}))
             except Exception as e:
                 self._send(200, json.dumps({"error": str(e)}))
+        elif self.path == "/api/loras":
+            try:
+                d = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                self._send(200, json.dumps(set_loras_disabled(d.get("disabled", []))))
+            except Exception as e:
+                self._send(200, json.dumps({"ok": False, "error": str(e)}))
         elif self.path == "/api/cancel":
             # 停止一批生图: 先 interrupt 停掉正在跑的那张,再从队列删掉所有排队任务
             try:

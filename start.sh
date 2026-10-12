@@ -216,7 +216,7 @@ else:
 total = web_rss
 for t in ("img", "vid", "llm"):
     s = svc.svc_status(t)
-    pid = open(svc.pid_path(t)).read().strip() if s["alive_pid"] else None
+    pid = s["alive_pid"] or None
     r = rss(pid) if pid else 0
     total += r
     mark = "🟢 运行中" if s["running"] else ("🟡 加载中" if s["alive_pid"] else "⚫ 已停止")

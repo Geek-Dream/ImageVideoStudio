@@ -283,8 +283,9 @@ def run_task(task_path, t):
                 name = _safe(f"test_{t['id']}_{m['id']}_p{pi}_{i}_{int(time.time())}")
                 try:
                     # 慢模型（尤其 Flux）一次多图可能超过固定 30 分钟。按模型估时和
-                    # 本批张数留出 10 分钟装载/解码余量，避免仍在计算时被误判失败。
-                    timeout = max(1800, int(m.get("sec") or 0) * n + 600)
+                    # 本批张数留出余量(估时×2 + 10 分钟装载/解码)，避免机器内存紧张
+                    # 变慢后仍在计算时被误判超时(实测内存挤爆时每张可能慢 2 倍)。
+                    timeout = max(1800, int(m.get("sec") or 0) * n * 2 + 600)
                     files, sec = gen_wait(ptext, m["id"], W, H, name,
                                           ref=pad_server, ipa=ipa_server, batch=n,
                                           timeout=timeout)

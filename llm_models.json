@@ -30,33 +30,6 @@
       }
     },
     {
-      "id": "qwen3.5-9b-q5-k-m",
-      "key": "QWEN35_9B_Q5_K_M",
-      "name": "Qwen3.5 9B · Q5_K_M",
-      "tag": "聊天/视觉/轻量",
-      "desc": "Qwen3.5 9B Q5_K_M 量化模型，配套 F16 视觉投影，适合本地聊天和图片理解。",
-      "speed_note": "约 6.1GB 主模型 + 876MB 视觉投影，适合 Apple Silicon 本地运行",
-      "recommended_temp": "0.6~0.8",
-      "gguf": "models/llm/Qwen3.5-9B-Q5_K_M.gguf",
-      "mmproj": "models/llm/aux/mmproj-Qwen3.5-9B-f16.gguf",
-      "chat_template": null,
-      "is_reasoning": true,
-      "has_mtp": false,
-      "supports_codex_proxy": true,
-      "gpu_mb": 8192,
-      "defaults": {
-        "thinking": true,
-        "temp": 0.7,
-        "max_tokens": 8192,
-        "ctx": 32768,
-        "parallel": 1,
-        "mtp": false,
-        "codex_proxy": false,
-        "budget": 2048,
-        "reasoning_level": "medium"
-      }
-    },
-    {
       "id": "qwen3-14b-abliterated-q5-k-m",
       "key": "QWEN3_14B_ABLITERATED_Q5_K_M",
       "name": "Qwen3-14B Abliterated · Q5_K_M",
@@ -98,6 +71,32 @@
         "budget": 2048,
         "reasoning_level": "medium"
       }
+    },
+    {
+      "id": "qwen3-coder-next-iq2-s",
+      "key": "QWEN3_CODER_NEXT_IQ2_S",
+      "name": "Qwen3-Coder-Next 80B-A3B · IQ2_S",
+      "tag": "编码/排错",
+      "desc": "Qwen3-Coder-Next 80B-A3B 混合MoE架构(注意力+SSM线性注意力+MoE专家,每token只激活3B),代码专精,写代码/排错/改bug用;IQ2_S压缩(21.8GB,比IQ2_XS略大略精细),实测 31.3 t/s;运行时整体内存约23GB(和IQ2_XS相近,模型本体21.8GB),32GB机器够用但别同时开大模型;长代码建议ctx开65536;纯文本模型,不支持视觉",
+      "gguf": "models/llm/Qwen_Qwen3-Coder-Next-IQ2_S.gguf",
+      "mmproj": null,
+      "chat_template": null,
+      "is_reasoning": false,
+      "has_mtp": false,
+      "supports_codex_proxy": true,
+      "gpu_mb": 25600,
+      "defaults": {
+        "thinking": false,
+        "temp": 0.3,
+        "max_tokens": 16384,
+        "ctx": 32768,
+        "parallel": 1,
+        "mtp": false,
+        "codex_proxy": false,
+        "budget": 2048,
+        "reasoning_level": "medium"
+      },
+      "speed_note": "实测 31.3 t/s"
     }
   ]
 }
